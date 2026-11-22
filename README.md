@@ -1,5 +1,7 @@
 PMXWeave is an open-source pharmacometrics knowledge base and toolkit for AI agents. It supports authoring NONMEM and mrgsolve models, translating models from other software, drawing model structure diagrams, estimating parameters in R, and generating HTML and Word reports.
 
+To get started, open the PMXWeave folder as your AI agent’s workspace.
+
 ## Runtime setup
 
 Agents can quickly draft models directly in chat without an R runtime. Report generation requires the R dependencies and a configured queue worker, which can run locally.
