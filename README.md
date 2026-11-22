@@ -80,5 +80,21 @@ Reported times include agent preparation, R analysis, and any narrative
 revisions. The local agent handled model fitting, results interpretation, and
 recovery from simulator issues.
 
+### Example figures
+
+**TMDD model structure**
+
+![TMDD model structure](example/figures/tmdd-model-structure.png)
+
+**Population PK — observed versus predicted concentration**
+
+![Observed versus predicted PK concentrations](example/figures/ppk-observed-versus-predicted.png)
+
+**Exposure-response — probability of objective response**
+
+![Estimated probability of objective response by exposure](example/figures/er-objective-response.png)
+
+<img src="example/figures/cqtc-simulation.png" alt="Concentration-QTc simulation" width="50%">
+
 Contact: Jian Zhou
 LinkedIn: https://www.linkedin.com/in/jian-zhou-a93533b9
