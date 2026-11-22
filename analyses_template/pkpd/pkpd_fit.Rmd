@@ -1,0 +1,193 @@
+---
+title: "PK/PD Model Fitting"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    fig_width: 9
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+pmx_shared <- function(f) {
+  root <- Sys.getenv("PMX_ROOT", "")
+  cand <- c(file.path("_shared", f), file.path("..", "_shared", f),
+            file.path("..", "..", "_shared", f),
+            file.path("02_html", "_shared", f),
+            file.path("analyses_template", "_shared", f))
+  if (nzchar(root))
+    cand <- c(cand, file.path(root, "_shared", f),
+              file.path(root, "02_html", "_shared", f),
+              file.path(root, "analyses_template", "_shared", f))
+  hit <- cand[file.exists(cand)]
+  if (!length(hit))
+    stop("shared fit template not found: ", f,
+         "\n  looked in: ", paste(cand, collapse = ", "), call. = FALSE)
+  hit[1]
+}
+knitr::knit_child(pmx_shared("fit_setup.Rmd"), quiet = TRUE)
+```
+
+```{r figure-layout, echo=FALSE, results='asis'}
+cat(pmx_fit_caption_style)
+```
+
+```{r switches}
+RUN_BOOTSTRAP <- FALSE   # non-parametric bootstrap CI (nlmixr2extra::bootstrapFit)
+RUN_SCM       <- FALSE   # covariate search (nlmixr2extra::covarSearchAuto)
+
+BOOT_NBOOT   <- 200      # replicate fits: each one is a full refit
+BOOT_CI      <- 0.95     # two-sided level -> percentile CI at 2.5 % / 97.5 %
+BOOT_STDERR  <- "perc"   # "perc" = percentile interval, which makes no symmetry
+BOOT_STRAT   <- NULL     # optional stratification variable, e.g. "DOSE"
+BOOT_RESTART <- FALSE    # TRUE discards the cache and starts the run over
+
+SCM_SEARCH  <- "scm"     # "scm" = forward + backward, or "forward"/"backward"
+SCM_PVAL    <- list(fwd = 0.05, bck = 0.01)   # pre-declared significance levels
+SCM_RESTART <- FALSE     # TRUE discards the cache and starts the search over
+SCM_MAP <- list(
+  tvcl    = c("AGE", "BW", "SEX", "RACE"),
+  tvv1    = c("BW", "SEX"),
+  tve0    = c("AGE"),
+  tvslope = c("AGE", "BW")
+)
+SCM_CAT <- c("SEX", "RACE")
+```
+
+# 1. Data Overview
+
+```{r read-data}
+df <- read.csv("pkpd_data.csv", na.strings = ".")
+pk_obs <- df %>% filter(EVID == 0, DVID == 1)
+pd_obs <- df %>% filter(EVID == 0, DVID == 2)
+
+cov_tab <- df %>% distinct(ID, .keep_all = TRUE)
+
+summary_tab <- data.frame(
+  Metric = c("Subjects", "Total records", "PK observations", "PD observations",
+             "Dose groups (mg/kg)", "Subjects per dose group", "Median BW (kg)"),
+  Value = c(
+    nrow(cov_tab),
+    nrow(df),
+    nrow(pk_obs),
+    nrow(pd_obs),
+    paste(sort(unique(cov_tab$DOSE)), collapse = ", "),
+    paste(sprintf("%s: n=%d", names(table(cov_tab$DOSE)),
+                  as.integer(table(cov_tab$DOSE))), collapse = "; "),
+    round(median(df$BW, na.rm = TRUE), 1)
+  )
+)
+kable(summary_tab, caption = "Dataset Summary", align = "lc")
+```
+
+## 1.1 Covariate Summary
+
+```{r cov-summary, results='asis'}
+cov_df <- df
+con_cov <- c("AGE","BW","BMI","ALB","CRCL")
+cat_cov <- c("SEX","RACE","DOSE")
+var_labels <- pmx_fit_covariate_labels(c(AGE="Age",BW="Body weight",BMI="BMI",
+  ALB="Albumin",CRCL="Creatinine clearance",SEX="Sex",RACE="Race",DOSE="Dose level"))
+cov_table <- pmx_patient_characteristics(cov_df,con_cov,cat_cov,var_labels,
+  level_display=pmx_fit_level_display,id="ID",label_column="Covariates")
+pmx_fit_characteristics_kable(cov_table)
+```
+
+## 1.2 PK Concentration-Time Profiles
+
+```{r pk-spaghetti, fig.width=9, fig.height=4, fig.cap="Individual PK concentration-time profiles"}
+ggplot(pk_obs, aes(TIME, DV, group = ID)) +
+  geom_line(alpha = 0.15, color = "steelblue") +
+  geom_point(size = 0.5, alpha = 0.3) +
+  scale_y_log10() +
+  labs(x = "Time (h)", y = "Concentration (ng/mL)") +
+  theme_bw()
+```
+
+## 1.3 PD Response-Time Profiles
+
+```{r pd-spaghetti, fig.width=9, fig.height=4, fig.cap="Individual PD response-time profiles"}
+ggplot(pd_obs, aes(TIME, DV, group = ID)) +
+  geom_line(alpha = 0.15, color = "darkorange") +
+  geom_point(size = 0.5, alpha = 0.3, color = "darkorange") +
+  scale_y_log10() +
+  labs(x = "Time (h)", y = "PD Response") +
+  theme_bw()
+```
+
+## 1.4 PK-PD Relationship (Hysteresis Check)
+
+```{r pkpd-hysteresis, fig.width=9, fig.height=4, fig.cap="PK–PD hysteresis plot"}
+merged <- pk_obs %>%
+  select(ID, TIME, DV) %>%
+  rename(CONC = DV) %>%
+  inner_join(
+    pd_obs %>% select(ID, TIME, DV) %>% rename(RESP = DV),
+    by = c("ID", "TIME")
+  )
+
+ggplot(merged, aes(CONC, RESP, group = ID)) +
+  geom_path(alpha = 0.3, color = "grey50") +
+  geom_point(aes(color = TIME), size = 1.5, alpha = 0.7) +
+  scale_x_log10() +
+  scale_color_gradient(low = "yellow", high = "darkred") +
+  labs(x = "Concentration (ng/mL)", y = "PD Response",
+       color = "Time (h)") +
+  theme_bw()
+```
+
+# 2. Model Fitting
+
+```{r fit-knobs, include=FALSE}
+FIT_FAM      <- "pkpd"
+FIT_SEC      <- c(save = 4, boot = 5, scm = 6)
+FIT_CTL      <- "base_model.ctl"
+FIT_THETA    <- c("TVCL", "TVV1", "TVQ", "TVV2", "TVE0", "TVSLOPE")
+FIT_ETA      <- c("ETA_CL", "ETA_V1")
+FIT_REFIT    <- TRUE
+
+FIT_ENDPOINT <- function(m) model(m, {
+  cp      <- ipred
+  pd_resp <- ipred2
+  cp      ~ lnorm(sdPK)
+  pd_resp ~ lnorm(sdPD)
+}, append = TRUE)
+
+FIT_PREP <- function(df) df %>%
+  filter(!(EVID == 0 & TIME == 0 & DVID == 2)) %>%
+  mutate(evid = EVID, amt = AMT, cmt = ifelse(EVID == 1, 1, NA), mdv = MDV,
+         dv = DV, nmdvid = DVID, dvid = DVID, eps1 = 0, eps2 = 0) %>%
+  select(ID, TIME, evid, amt, cmt, mdv, dv, nmdvid, dvid, BW, eps1, eps2)
+```
+
+```{r fit-core, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_core.Rmd"), quiet = TRUE), sep = "\n")
+```
+
+# 3. Model-Predicted PK-PD Curve
+
+```{r pkpd-curve, fig.width=9, fig.height=4, fig.cap="Model-predicted concentration–response relationship"}
+conc_seq <- exp(seq(log(0.01), log(1000), length.out = 200))
+pred_pd <- data.frame(
+  CONC = conc_seq,
+  PRED = fixef(fit)["TVE0"] + fixef(fit)["TVSLOPE"] * conc_seq
+)
+
+merged_plot <- merged %>%
+  mutate(DOSE_GRP = cut(CONC, breaks = c(0, 1, 10, 100, Inf),
+                        labels = c("Low", "Mid", "High", "Very High")))
+
+ggplot() +
+  geom_point(data = merged_plot, aes(CONC, RESP), alpha = 0.3, color = "grey50") +
+  geom_line(data = pred_pd, aes(CONC, PRED), color = "red", linewidth = 1.2) +
+  scale_x_log10() +
+  labs(x = "Concentration (ng/mL)", y = "PD Response") +
+  theme_bw()
+```
+
+```{r fit-tail, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_tail.Rmd"), quiet = TRUE), sep = "\n")
+```

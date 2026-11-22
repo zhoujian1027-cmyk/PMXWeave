@@ -1,0 +1,30 @@
+variable,label,description,type,unit,code,value_label,status,notes
+ID,Subject identifier,Unique subject identifier; repeated records belong to the same simulated patient.,identifier,,,,confirmed,
+TIME,Time,Elapsed time from the first administration.,time,h,,,confirmed,Definition and unit explicitly confirmed by the user.
+DV,Drug concentration,Observed concentration for the central-compartment PK endpoint; a dot denotes a missing value.,observation,mg/L,,,confirmed,Definition and unit explicitly confirmed by the user.
+AMT,Dose amount,Amount administered on a dosing record; zero on observation records.,dose,mg,,,confirmed,Definition and unit explicitly confirmed by the user.
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,0,Observation,confirmed,
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,1,Dose administration,confirmed,
+CMT,Compartment,"Model compartment index: depot, central or peripheral. Observations use the central compartment.",event,,1,Depot,confirmed,
+CMT,Compartment,"Model compartment index: depot, central or peripheral. Observations use the central compartment.",event,,2,Central,confirmed,
+CMT,Compartment,"Model compartment index: depot, central or peripheral. Observations use the central compartment.",event,,3,Peripheral,confirmed,Compartment 3 is defined in the model but is not used by current data records.
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,0,Usable observation,confirmed,
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,1,DV not used as an observation,confirmed,
+ADDL,Additional doses,Number of additional doses implied by this record; all values are zero in the current dataset.,regimen,,,,confirmed,
+II,Interdose interval,Interval used with ADDL or steady-state dosing; all values are zero because administrations are explicit records.,regimen,h,,,confirmed,Definition and unit explicitly confirmed by the user.
+RATE,Infusion rate,Administration rate; zero denotes a bolus/depot dose in this dataset.,regimen,mg/h,,,confirmed,
+STUDYID,Study,Study identifier; all simulated records belong to Study 101.,study,,101,Study 101,confirmed,
+BW,Body weight,Baseline body weight.,continuous,kg,,,confirmed,Definition and unit explicitly confirmed by the user.
+SEX,Sex,Recorded sex category.,categorical,,1,Male,confirmed,Category coding explicitly confirmed by the user.
+SEX,Sex,Recorded sex category.,categorical,,2,Female,confirmed,Category coding explicitly confirmed by the user.
+AGE,Age,Baseline age.,continuous,years,,,confirmed,Definition and unit explicitly confirmed by the user.
+RACE,Race,Recorded race category.,categorical,,1,White,confirmed,Category coding explicitly confirmed by the user.
+RACE,Race,Recorded race category.,categorical,,2,Asian,confirmed,Category coding explicitly confirmed by the user.
+RACE,Race,Recorded race category.,categorical,,3,Black or African American,confirmed,Category coding explicitly confirmed by the user.
+RACE,Race,Recorded race category.,categorical,,4,Other,confirmed,Category coding explicitly confirmed by the user.
+BMI,Body mass index,Baseline body mass index.,continuous,kg/m2,,,confirmed,Definition and unit explicitly confirmed by the user.
+ALB,Albumin,Baseline albumin concentration.,continuous,g/dL,,,confirmed,Definition and unit explicitly confirmed by the user.
+CRCL,Creatinine clearance,Baseline creatinine clearance.,continuous,mL/min,,,confirmed,Definition and unit explicitly confirmed by the user.
+DOSE,Dose level,Text label for the administered dose group; excluded from model input by DOSE=DROP.,regimen,mg,100 mg,100 mg,confirmed,
+DOSE,Dose level,Text label for the administered dose group; excluded from model input by DOSE=DROP.,regimen,mg,200 mg,200 mg,confirmed,
+ADY,Analysis day,Day index from the first administration: floor(TIME/24)+1.,time,day,,,confirmed,

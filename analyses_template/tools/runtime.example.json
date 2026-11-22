@@ -1,0 +1,6 @@
+{
+  "queue_root": "./studies/.pmx-runtime",
+  "workspace_root": "./studies",
+  "execution": "local",
+  "path_mappings": []
+}

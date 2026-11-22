@@ -1,0 +1,29 @@
+$PARAM NTR = 3, TVMTT = 1, TVCL = 5, TVV2 = 50
+
+$CMT TRANSIT1 TRANSIT2 TRANSIT3 CENTRAL
+
+$OMEGA
+0.09 0.16 0.25
+
+$SIGMA
+0.1
+
+$MAIN
+double CL = TVCL * exp(ETA(1));
+double V2 = TVV2 * exp(ETA(2));
+double MTT = TVMTT * exp(ETA(3));
+double KTR = NTR / MTT;
+
+$ODE
+dxdt_TRANSIT1 = -KTR * TRANSIT1;
+dxdt_TRANSIT2 = KTR * TRANSIT1 - KTR * TRANSIT2;
+dxdt_TRANSIT3 = KTR * TRANSIT2 - KTR * TRANSIT3;
+dxdt_CENTRAL = KTR * TRANSIT3 - (CL / V2) * CENTRAL;
+
+$TABLE
+double IPRED = CENTRAL / V2;
+
+double DV = IPRED + IPRED * EPS(1);
+
+$CAPTURE IPRED DV
+

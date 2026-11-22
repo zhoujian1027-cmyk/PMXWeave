@@ -1,0 +1,109 @@
+$PROBLEM ADVAN13 parent_metabolite_Emax PO 2-cpt | FOCE
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID BW SEX
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(DEPOT) COMP=(CENTRAL) COMP=(PERIPH) COMP=(METAB)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVV1 = THETA(2)
+TVQ = THETA(3)
+TVV2 = THETA(4)
+TVKA = THETA(5)
+TVLAG = THETA(6)
+TVVMAX = THETA(7)
+TVKM = THETA(8)
+TVCLM = THETA(9)
+TVVM = THETA(10)
+
+; Covariate effects
+FBWCL = (BW/70)**0.75
+IF (SEX.EQ.2) THEN
+  FSEX = THETA(11)
+ELSE
+  FSEX = 1
+ENDIF
+
+; Parent PK parameters
+CL = TVCL * EXP(ETA(1)) * FBWCL * FSEX
+V1 = TVV1 * EXP(ETA(2))
+Q = TVQ * EXP(ETA(3))
+V2 = TVV2 * EXP(ETA(4))
+KA = TVKA * EXP(ETA(5))
+ALAG1 = TVLAG * EXP(ETA(6))
+
+; Metabolite formation (Emax/saturable) & disposition
+VMAX = TVVMAX * EXP(ETA(7))
+KM = TVKM * EXP(ETA(8))
+CLM = TVCLM * EXP(ETA(9))
+VM = TVVM * EXP(ETA(10))
+
+$DES
+K12 = KA
+K20 = CL/V1
+K23 = Q/V1
+K32 = Q/V2
+K40 = CLM/VM
+C2 = A(2)/V1    ; parent concentration
+RATE_FORM = VMAX*C2/(KM + C2)    ; saturable metabolite formation (Amt/Time)
+DADT(1) = -K12*A(1)
+DADT(2) = K12*A(1) + K32*A(3) - K23*A(2) - K20*A(2) - RATE_FORM
+DADT(3) = K23*A(2) - K32*A(3)
+DADT(4) = RATE_FORM - K40*A(4)
+
+$ERROR
+PARENTCONC = A(2)/V1
+METABCONC = A(4)/VM
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.2.AND.PARENTCONC.GT.0) THEN
+  IPRED = LOG(PARENTCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.4.AND.METABCONC.GT.0) THEN
+  IPRED = LOG(METABCONC)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 5) ; THETA(1) TVCL
+(0, 50) ; THETA(2) TVV1
+(0, 10) ; THETA(3) TVQ
+(0, 50) ; THETA(4) TVV2
+(0, 1) ; THETA(5) TVKA
+(0, 1) ; THETA(6) TVLAG
+(0, 10) ; THETA(7) TVVMAX
+(0, 1) ; THETA(8) TVKM
+(0, 5) ; THETA(9) TVCLM
+(0, 50) ; THETA(10) TVVM
+1 ; THETA(11) SEXEFF
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) V1
+0.2         ; ETA(3) Q
+0.2         ; ETA(4) V2
+0.2         ; ETA(5) KA
+0.2         ; ETA(6) ALAG
+0.2         ; ETA(7) VMAX
+0.2         ; ETA(8) KM
+0.2         ; ETA(9) CLM
+0.2         ; ETA(10) VM
+
+$SIGMA
+0.1 ; Parent log-additive error
+0.1 ; Metabolite log-additive error
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output FORMAT=1F12.5

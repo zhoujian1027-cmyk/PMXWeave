@@ -1,0 +1,69 @@
+$PROBLEM ADVAN13 dual abs 1-cpt | FOCE | comb
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID BW
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(DEPOT1) COMP=(DEPOT2) COMP=(CENTRAL)
+
+$PK
+; Typical values
+TVVC = THETA(1)
+TVCL = THETA(2)
+TVKA1 = THETA(3)
+TVKA2 = THETA(4)
+TVALAG2 = THETA(5)
+TVF1 = THETA(6)
+
+; Covariate effects
+FBWCL = (BW/70)**0.75
+
+; Individual parameters
+VC = TVVC * EXP(ETA(1))
+CL = TVCL * EXP(ETA(2)) * FBWCL
+KA1 = TVKA1 * EXP(ETA(3))
+KA2 = TVKA2 * EXP(ETA(4))
+ALAG2 = TVALAG2
+F1 = TVF1
+F2 = 1 - F1
+
+; Derived parameters
+K13 = KA1
+K23 = KA2
+K30 = CL/VC
+
+$DES
+DADT(1) = -K13*A(1)
+DADT(2) = -K23*A(2)
+DADT(3) = K13*A(1) + K23*A(2) - K30*A(3)
+
+$ERROR
+IPRED = A(3)/VC
+
+Y = IPRED + IPRED * EPS(1) + EPS(2)
+
+$THETA
+(0, 50) ; THETA(1) TVVC
+(0, 5) ; THETA(2) TVCL
+(0, 1) ; THETA(3) TVKA1
+(0, 1) ; THETA(4) TVKA2
+(0, 1) ; THETA(5) TVALAG2
+(0, 0.5, 1) ; THETA(6) TVF1
+
+$OMEGA
+0.1         ; IIV_VC
+0.1         ; IIV_CL
+0.1         ; IIV_KA1
+0.1         ; IIV_KA2
+
+$SIGMA
+0.1 ; Proportional variance
+0.1 ; Additive variance
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=output

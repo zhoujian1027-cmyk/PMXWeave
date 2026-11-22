@@ -1,0 +1,110 @@
+$PROBLEM Gompertz-Emax TGI 2-cpt PO | SAEM
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(DEPOT) COMP=(CENTRAL) COMP=(PERIPH) COMP=(TUMOR)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVVC = THETA(2)
+TVKA = THETA(3)
+TVQ = THETA(4)
+TVVP = THETA(5)
+TVW0 = THETA(6)
+TVALPHA0 = THETA(7)
+TVBETA = THETA(8)
+TVEMAX = THETA(9)
+TVEC50 = THETA(10)
+
+; MU references
+MU_1 = LOG(TVCL)
+MU_2 = LOG(TVVC)
+MU_3 = LOG(TVKA)
+MU_4 = LOG(TVQ)
+MU_5 = LOG(TVVP)
+MU_6 = LOG(TVW0)
+MU_7 = LOG(TVALPHA0)
+MU_8 = LOG(TVEMAX)
+
+; PK parameters
+CL = EXP(MU_1 + ETA(1))
+VC = EXP(MU_2 + ETA(2))
+KA = EXP(MU_3 + ETA(3))
+Q = EXP(MU_4 + ETA(4))
+VP = EXP(MU_5 + ETA(5))
+
+; Tumor growth/kill parameters
+W0 = EXP(MU_6 + ETA(6))
+ALPHA0 = EXP(MU_7 + ETA(7))
+BETA = TVBETA
+EMAX = EXP(MU_8 + ETA(8))
+EC50 = TVEC50
+A_0(4) = W0
+
+$DES
+K12 = KA
+K20 = CL/VC
+K23 = Q/VC
+K32 = Q/VP
+DADT(1) = -K12*A(1)
+DADT(2) = K12*A(1) + K32*A(3) - K23*A(2) - K20*A(2)
+DADT(3) = K23*A(2) - K32*A(3)
+C2 = A(2)/VC    ; drug concentration
+GROWTH = ALPHA0*EXP(-BETA*T)    ; Gompertzian specific growth rate
+INHIB = EMAX*C2/(EC50+C2)    ; saturable drug-driven inhibition
+DADT(4) = (GROWTH - INHIB)*A(4)    ; tumor mass
+
+$ERROR
+PKCONC = A(2)/VC
+PDRESP = A(4)
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.2.AND.PKCONC.GT.0) THEN
+  IPRED = LOG(PKCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.4.AND.PDRESP.GT.0) THEN
+  IPRED = LOG(PDRESP)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 0.5) ; THETA(1) TVCL
+(0, 2) ; THETA(2) TVVC
+(0, 1) ; THETA(3) TVKA
+(0, 1) ; THETA(4) TVQ
+(0, 2) ; THETA(5) TVVP
+(0, 0.2) ; THETA(6) TVW0
+(0, 0.3) ; THETA(7) TVALPHA0
+(0, 0.05) ; THETA(8) TVBETA
+(0, 1) ; THETA(9) TVEMAX
+(0, 10) ; THETA(10) TVEC50
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) VC
+0.2         ; ETA(3) KA
+0.2         ; ETA(4) Q
+0.2         ; ETA(5) VP
+0.2         ; ETA(6) W0
+0.2         ; ETA(7) ALPHA0
+0.2         ; ETA(8) EMAX
+
+$SIGMA
+0.1 ; PK log-additive error
+0.1 ; Tumor log-additive error
+
+$ESTIMATION METHOD=SAEM INTERACTION NBURN=2000 NITER=1000
+
+$ESTIMATION METHOD=IMP EONLY=1 ISAMPLE=1000 NITER=5
+; $COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output FORMAT=1PE12.5

@@ -1,0 +1,40 @@
+$PROB PKPD sim (mrgsolve translation of the frozen control stream by stage 2)
+$PARAM TVCL = 5.560467588920, TVVC = 50.404183480500, TVQ = 9.532710195190, TVVP = 53.281710172600, TVE0 = 11.336480551300, TVKOUT = 0.128230724375, TVIMAX = 0.709700560946, TVIC50 = 1.312326604700
+$CMT CENTRAL PERIPH RESPONSE
+$OMEGA @block
+0.276099814857
+0.000000000000 0.185363819678
+0.000000000000 0.000000000000 0.178620875892
+0.000000000000 0.000000000000 0.000000000000 0.374351885802
+$SIGMA
+0.100952000361
+0.0957393365447
+$MAIN
+double CL = (TVCL * exp(ETA(1)));
+double VC = (TVVC * exp(ETA(2)));
+double Q = TVQ;
+double VP = TVVP;
+double E0 = (TVE0 * exp(ETA(3)));
+double KOUT = (TVKOUT * exp(ETA(4)));
+double KIN = (E0 * KOUT);
+double R0 = (KIN / KOUT);
+RESPONSE_0 = R0;
+double IMAX = TVIMAX;
+double IC50 = TVIC50;
+$ODE
+double K10 = (CL / VC);
+double K12 = (Q / VC);
+double K21 = (Q / VP);
+dxdt_CENTRAL = ((((-K10) * CENTRAL) - (K12 * CENTRAL)) + (K21 * PERIPH));
+dxdt_PERIPH = ((K12 * CENTRAL) - (K21 * PERIPH));
+double C1 = (CENTRAL / VC);
+double EFF = ((IMAX * C1) / ((IC50 + C1)));
+dxdt_RESPONSE = (KIN - ((KOUT * ((1.0 - EFF))) * RESPONSE));
+$TABLE
+double PKCONC = (CENTRAL / VC);
+double PDRESP = RESPONSE;
+double IPRED = log(((PKCONC > 0.0) ? PKCONC : 0.0001));
+double IPRED_PD = log(((PDRESP > 0.0) ? PDRESP : 0.0001));
+double DV_PK = IPRED + (PKCONC > 0.0 ? EPS(1) : 0.0);
+double DV_PD = IPRED_PD + (PDRESP > 0.0 ? EPS(2) : 0.0);
+$CAPTURE IPRED IPRED_PD DV_PK DV_PD

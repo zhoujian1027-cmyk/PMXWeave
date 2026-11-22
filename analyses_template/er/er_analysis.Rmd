@@ -1,0 +1,2034 @@
+---
+title: "Exposure-Response Analysis Report"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: cosmo
+    fig_width: 9
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+.cpu_paths <- c(file.path(dirname(Sys.getenv("STAGES_DIR")),"cpu_budget.R"),
+                file.path(Sys.getenv("PMX_TOOLKIT"),"word-report","cpu_budget.R"),
+                ".pmx/word-report/cpu_budget.R", ".pmx/pmx_workspace/word-report/cpu_budget.R",
+                "../.pmx/pmx_workspace/word-report/cpu_budget.R", "word-report/cpu_budget.R")
+.cpu_path <- .cpu_paths[file.exists(.cpu_paths)][1]
+if(is.na(.cpu_path)) stop("PMX_CPU_TOOLKIT_REQUIRED: complete reusable toolkit required")
+source(.cpu_path)
+pmx_cpu_setup(threads=1L)
+knitr::opts_chunk$set(error=FALSE,
+  echo = FALSE,          # report output; set TRUE to show the code
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 6,
+  fig.align = "center"
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)      # data manipulation
+  library(tidyr)      # pivot_longer / pivot_wider
+  library(tibble)     # rownames_to_column / tribble
+  library(ggplot2)    # forest plots / exposure-response plots
+  library(stringr)    # coefficient-name cleanup
+  library(knitr)      # kable tables (the Word extractor reads these)
+  library(survival)   # Surv / survfit / coxph
+  library(survminer)  # ggsurvplot
+  library(cowplot)    # plot_grid
+  library(scales)     # percent / label_number
+})
+```
+
+```{r switches}
+DATA_FILE <- Sys.getenv("PMX_DATA", "")      # NULL = auto-discover the study's csv (see the adapter).
+OUT_DIR   <- Sys.getenv("PMX_OUTPUT_DIR", "output")
+EP_FIT <- EP_COVEFF_OK <- EP_FOREST_REASON <- list()
+
+RUN_EFFEC  <- TRUE    # exposure-efficacy: every endpoint in END_DEF the table carries
+RUN_SAFETY <- TRUE
+SAFETY_MODEL_ENDPOINTS <- "SAE"
+SAFETY_DEF <- list(
+  list(var = "SAE",      lab = "Serious adverse events (SAE)"),
+  list(var = "TEAEG3",   lab = ">= Grade 3 TEAE",                    time = "TEAEG3TIME"),
+  list(var = "TRAEG3",   lab = ">= Grade 3 TRAE",                    time = "TRAEG3TIME"),
+  list(var = "INFG3",    lab = ">= Grade 3 infections",              time = "INFG3TIME"),
+  list(var = "HEMG3",    lab = "Major haemorrhage"),
+  list(var = "ANEMIAG3", lab = ">= Grade 3 anaemia"),
+  list(var = "NEUTG3",   lab = ">= Grade 3 neutropenia",             time = "NEUTG3TIME"),
+  list(var = "THROMBG3", lab = ">= Grade 3 thrombocytopenia"),
+  list(var = "SPM",      lab = "Second primary malignancies"),
+  list(var = "AFG3",     lab = ">= Grade 3 atrial fibrillation / flutter"),
+  list(var = "HYPERTG3", lab = ">= Grade 3 hypertension")
+)
+RUN_SAFETY_TTE <- FALSE  # also draw the Kaplan-Meier curve (cumulative incidence by
+RUN_REGRESSION <- TRUE   # the model-based part (logistic / Cox). OPTIONAL: with FALSE the
+RUN_ORR    <- TRUE    # keep the ORR endpoint
+RUN_DOR    <- TRUE    # keep the DoR endpoint
+RUN_PFS    <- TRUE    # keep the PFS endpoint
+SAVE_OUTPUTS <- FALSE # TRUE exports named result tables to table/analysis/.
+ANALYSIS_TABLE_DIR <- file.path("table","analysis")
+
+DRUG       <- ""
+STUDY      <- ""
+INDICATION <- ""
+REPORT_REFERENCES <- character() # Verified reference entries; leave empty if none are supplied.
+
+PK_EXPO     <- "Cavg24hss"        # steady-state average concentration
+PK_EXPO_LAB <- Sys.getenv("PMX_EXPOSURE_LABEL", "")
+PK_EXPO_EOT <- "Cavg_EOT"         # average concentration to end of treatment
+LOGPK       <- TRUE               # model log(exposure)
+N_QUANTILE  <- 4                  # exposure quartiles
+SCREEN_P    <- NA                 # NA = BIC only
+
+END_DEF <- list(
+  list(kind = "binary", var = "ORR",   label = "ORR"),
+  list(kind = "binary", var = "uMRD",  label = "uMRD",
+       alts = c("UMRD", "MRD", "MRD_NEGATIVE", "MRDNEG")),
+  list(kind = "binary", var = "CR",    label = "CR"),
+  list(kind = "binary", var = "DCR",   label = "DCR"),
+  list(kind = "tte", timevar = "DORMIN", evvar = "DOREVT", label = "DoR",
+       short = "dor", direction = "down", sub = "responders"),
+  list(kind = "tte", timevar = "PFSTIME", evvar = "PFSEVT", label = "PFS",
+       short = "pfs", direction = "down"),
+  list(kind = "tte", timevar = "OSTIME", evvar = "OSEVT", label = "OS",
+       short = "os", direction = "down"),
+  list(kind = "tte", timevar = "UMRDTIME", evvar = "UMRDEVT", label = "Time to uMRD",
+       short = "umrdsurv", direction = "up")
+)
+
+END_TTE_ALIAS <- list(
+  DORMIN   = c("DOR_DUR", "DOR_DURATION", "DURATION", "DOR"),
+  DOREVT   = c("DOR_EVENT", "DOREVENT", "DORCNSR", "DORCENS"),
+  PFSTIME  = c("PFS_TIME", "PFSTIM", "PROGTIME", "PFS", "PFSTIM_MONTHS"),
+  PFSEVT   = c("PFS_EVENT", "PFSEVENT", "PFSCNSR", "PFS_STATUS"),
+  OSTIME   = c("OS_TIME", "OSTIM", "SURVTIME", "OS"),
+  OSEVT    = c("OS_EVENT", "OSEVENT", "OSCNSR", "OS_STATUS"),
+  UMRDTIME = c("UMRD_TIME", "T_UMRD", "TIME_TO_UMRD", "TIMETOURD", "UMRD_MONTHS",
+               "MRDTIME", "MRD_TIME"),
+  UMRDEVT  = c("UMRD_EVENT", "UMRDEVENT", "UMRD_CENSOR", "UMRDCNSR", "MRDEVT",
+               "MRD_EVENT", "UMRD_STATUS")
+)
+
+END_AUTO <- TRUE                  # set FALSE to analyse END_DEF only
+```
+
+```{r covariate-config}
+# Covariate configuration
+
+# Covariate candidates
+CON_COV <- c("AGE", "WGTRL", "BMI", "BSA", "ALB", "CRCL", "LDH", "HGB", "NEUT", "PLT")
+
+CAT_COV <- c("ECOGBL0", "AGEGR1", "SEXF", "RACE", "REGION", "DISSTG", "BRAINM",
+             "NPTRLINEG3", "LDHHI", "NEUTLOW")
+
+# Covariate names and units
+COV_LABEL <- c(
+  AGE        = "Age",
+  WGTRL      = "Body weight",
+  BMI        = "BMI",
+  BSA        = "Body surface area",
+  ALB        = "Albumin",
+  CRCL       = "Creatinine clearance",
+  LDH        = "Lactate dehydrogenase",
+  HGB        = "Haemoglobin",
+  NEUT       = "Neutrophils",
+  PLT        = "Platelets",
+  NPTRLINE   = "Prior lines",
+  LDHHI      = "LDH above ULN",
+  NEUTLOW    = "Baseline neutropenia",
+  NPTRLINEG3 = ">= 3 prior lines",
+  AGEGR1     = "Age group",
+  ECOGBL0    = "ECOG 0",
+  SEXF       = "Sex",
+  RACE       = "Race",
+  REGION     = "Region",
+  DISSTG     = "Disease stage",
+  BRAINM     = "Brain metastases",
+  DOSE       = "Dose",
+  DOSEF      = "Dose group"
+)
+
+ALBUMIN_LLN <- NULL
+
+COV_UNIT <- c(
+  AGE      = "years",
+  WGTRL    = "kg",
+  BMI      = "kg/m2",
+  CRCL     = "mL/min",
+  LDH      = "U/L",
+  HGB      = "g/L",
+  NEUT     = "10^9/L",
+  PLT      = "10^9/L",
+  NPTRLINE = "n",
+  DOSE     = "mg"
+)
+
+# Categorical labels
+COV_LEVELS <- list(
+  SEXF       = c(M = "Male", F = "Female"),
+  AGEGR1     = c("<65" = "< 65 years", ">=65" = ">= 65 years"),
+  DISSTG     = c(I = "Stage I", II = "Stage II", III = "Stage III", IV = "Stage IV"),
+  BRAINM     = c(No = "No", Yes = "Yes"),
+  LDHHI      = c(No = "No", Yes = "Yes"),
+  NEUTLOW    = c(No = "No", Yes = "Yes"),
+  NPTRLINEG3 = c(No = "No", Yes = "Yes")
+)
+
+# Categorical references
+COV_REF <- "modal"
+
+# Derived covariates
+COV_DERIVE <- list(
+  ECOGBL0    = function(d) as.integer(num(d$ECOGBL) == 0),
+  NPTRLINEG3 = function(d) ifelse(num(d$NPTRLINE) >= 3, "Yes", "No"),
+  LDHHI      = function(d) ifelse(num(d$LDH) > 250, "Yes", "No"),
+  NEUTLOW    = function(d) ifelse(num(d$NEUT) < 1.5, "Yes", "No"),
+  SEXF       = function(d) as.character(d$SEX),
+  DOSEF      = function(d) factor(as.character(d$DOSE))
+)
+
+# Dose group
+DOSE_VAR  <- "DOSE"
+REG_LABEL <- "Dose (mg QD)"
+
+CONFIG <- Sys.getenv("PMX_CONFIG","")
+.intake_helper <- file.path(dirname(.cpu_path),"..","analyses_template","tools","covariate_intake.R")
+if(!file.exists(.intake_helper)) stop("PMX_COVARIATE_TOOLKIT_REQUIRED: analyses_template/tools/covariate_intake.R is missing")
+source(.intake_helper)
+.covariate_review <- pmx_covariate_intake(CONFIG,"er")
+ALL_COV <- unique(c(CON_COV,CAT_COV))
+if (!is.character(SAFETY_MODEL_ENDPOINTS) || anyNA(SAFETY_MODEL_ENDPOINTS))
+  stop("SAFETY_MODEL_ENDPOINTS must be a character vector")
+SAFETY_MODEL_ENDPOINTS <- unique(toupper(trimws(SAFETY_MODEL_ENDPOINTS)))
+valid_safety_endpoint <- function(definition) {
+  is.list(definition) && is.character(definition$var) &&
+    length(definition$var)==1L && !is.na(definition$var) && nzchar(definition$var) &&
+    is.character(definition$lab) && length(definition$lab)==1L &&
+    !is.na(definition$lab) && nzchar(definition$lab) &&
+    (is.null(definition$time) || (is.character(definition$time) &&
+      length(definition$time)==1L && !is.na(definition$time) && nzchar(definition$time)))
+}
+if(!is.list(SAFETY_DEF) || !all(vapply(SAFETY_DEF,valid_safety_endpoint,TRUE)) ||
+   anyDuplicated(toupper(vapply(SAFETY_DEF,function(x) x$var,""))))
+  stop("SAFETY_DEF must define unique endpoints with var, lab and optional time fields")
+if (length(SCREEN_P) != 1L || (!is.numeric(SCREEN_P) && !is.na(SCREEN_P)) ||
+    (!is.na(SCREEN_P) && (!is.finite(SCREEN_P) || SCREEN_P <= 0 || SCREEN_P >= 1)))
+  stop("SCREEN_P must be a probability between 0 and 1, or NA")
+if(length(intersect(CON_COV,CAT_COV))) stop("A covariate cannot be continuous and categorical")
+if(any(c(DOSE_VAR,"DOSEF") %in% ALL_COV)) stop("Declare dose as descriptive or explicitly revise the analysis plan")
+```
+
+```{r read-data}
+if (is.null(DATA_FILE) || !nzchar(DATA_FILE)) {
+  cand <- list.files(".", pattern = "\\.csv$", ignore.case = TRUE)
+  cand <- cand[!grepl("^(tbl_|html_tbl_|labels[.]csv$|endpoints[.]csv$|safety_endpoints[.]csv$|covariates[.]csv$|nca_initials[.]csv$|ladder_table[.]csv$)",cand)]
+  if (!length(cand))
+    stop("ER_SCHEMA_NO_DATA: no *.csv in ", getwd(),
+         " — put the study's subject-level table here.")
+  pref <- grep("(^|[_-])er([_-]|$)|expos|response", cand, ignore.case = TRUE, value = TRUE)
+  DATA_FILE <- if (length(pref)) pref[1] else if (length(cand) == 1) cand[1] else
+    stop("ER_SCHEMA_AMBIGUOUS_DATA: several csv present (",
+         paste(cand, collapse = ", "), ") — set DATA_FILE in the switches chunk.")
+}
+message("ER_SCHEMA_DATA ", DATA_FILE)
+er_all <- read.csv(DATA_FILE, na.strings = c("", ".", "NA", "unknown", "not reported", "missing"),
+                   check.names = FALSE)
+
+pick <- function(nms, alts) {
+  for (a in alts) { i <- which(toupper(nms) == toupper(a)); if (length(i)) return(nms[i[1]]) }
+  NULL
+}
+ER_SOURCE_NAMES <- character(0)
+adopt <- function(d, canon, alts) {
+  hit <- pick(names(d), c(canon, alts))
+  if (!is.null(hit)) {
+    ER_SOURCE_NAMES[canon] <<- hit
+    names(d)[names(d) == hit] <- canon
+  }
+  d
+}
+ER_ALIAS <- list(
+  SUBJID   = c("USUBJID", "SUBJIDN", "SUBJECT", "PATIENT", "ID"),
+  TRT      = c("TRTNAME", "TREATMENT", "ARM"),
+  DOSE     = c("DOSE_MG", "DOSELEVEL", "DOSEMG", "DOSE_ADMIN", "DOSEF"),
+  ORR      = c("RESPONSE", "OR_RESP", "RESPRESP", "OR"),
+  DORMIN   = c("DOR_DUR", "DOR_DURATION", "DURATION", "DOR"),
+  DOREVT   = c("DOR_EVENT", "DOREVENT", "DORCNSR"),
+  PFSTIME  = c("PFS_TIME", "PFSTIM", "PROGTIME", "PFS"),
+  PFSEVT   = c("PFS_EVENT", "PFSEVENT", "PFSCNSR"),
+  OSTIME   = c("OS_TIME", "OSTIM", "SURVTIME", "OS"),
+  OSEVT    = c("OS_EVENT", "OSEVENT", "OSCNSR"),
+  WC       = c("WGTBL", "WEIGHT", "WTBL", "BWT", "WGTRL"),
+  AGE      = c("AGEBL", "AGE_YEARS", "AGEYR"),
+  SEX      = c("SEXCD", "GENDER"),
+  RACE     = c("RACECD", "RACEN"),
+  REGION   = c("COUNTRY", "GEOGRAPHICREGION"),
+  ECOGBL   = c("ECOG", "ECOG_BL", "ECOGPS"),
+  BSA      = c("BSABL", "BSA_M2"),
+  ALB      = c("ALBUMIN", "ALBBL"),
+  CRCL     = c("CRCLBL", "CRCL_MLMIN", "CRCLBL1"),
+  BMI      = c("BMIBL", "BMI_KGM2"),
+  LDH      = c("LDHBL", "LDH_UL"),
+  HGB      = c("HGBBL", "HEMOGLOBIN"),
+  NEUT     = c("NEUTBL", "ANC", "NEUTROPHIL"),
+  PLT      = c("PLTBL", "PLATELET", "PLATELETS"),
+  NPTRLINE = c("PRIORLINES", "NPRIORLINES", "NUMPRIOR"),
+  DISSTG   = c("STAGE", "DISEASESTAGE"),
+  BRAINM   = c("BRAINMET", "BMETS", "CNSMETS"),
+  AGEGR1   = c("AGE_GRP", "AGEGROUP")
+)
+for (cn in names(ER_ALIAS)) er_all <- adopt(er_all, cn, ER_ALIAS[[cn]])
+
+EXPO_ALIAS <- c("CAVG24HSS", "CAVGSS", "CAVG_SS", "CAVG24", "CAVG", "CAVGBL", "CAVGB",
+                "AUCSS", "AUC_SS", "AUC", "AUCLAST", "AUCTAU", "CMAX24HSS", "CMAX", "CMAXSS",
+                "EXPOSURE", "EXPO", "CONC", "CONCSS", "PREDOSE_CONC")
+if (!PK_EXPO %in% names(er_all)) {
+  hit <- pick(names(er_all), EXPO_ALIAS)
+  if (!is.null(hit)) {
+    PK_EXPO <- hit
+    if(!nzchar(PK_EXPO_LAB)) PK_EXPO_LAB <- hit
+    message("ER_SCHEMA_EXPO ", hit, " -> ", PK_EXPO)
+  }
+}
+if (!PK_EXPO_EOT %in% names(er_all)) {
+  hit <- pick(names(er_all), c("CAVG_EOT", "CAVGEOT", "EXPO_EOT", "CAVGEOTIND"))
+  if (!is.null(hit)) names(er_all)[names(er_all) == hit] <- PK_EXPO_EOT
+}
+
+if(!nzchar(PK_EXPO_LAB)) PK_EXPO_LAB <- PK_EXPO
+for (cn in c("STUDYID", "TRT", "DOSE", "ORR", "EXCLREAS", "ECOGBL", "AGEGR1", "SEX",
+             "RACE", "REGION", "DISSTG", "BRAINM", "NPTRLINE", "LDH", "NEUT", "WC",
+             PK_EXPO, PK_EXPO_EOT))
+  if (!cn %in% names(er_all)) er_all[[cn]] <- NA
+
+.first_ok <- function(x) { x <- unique(x[!is.na(x) & nzchar(as.character(x))]); if (length(x)) as.character(x)[1] else NA_character_ }
+if (!nzchar(DRUG)) {
+  DRUG <- if ("TRT" %in% names(er_all))
+            sub("[[:space:]]*[0-9].*$", "", .first_ok(er_all$TRT)) else NA_character_
+  DRUG <- if (is.na(DRUG) || !nzchar(DRUG) || tolower(DRUG)=="drug") "study treatment" else DRUG
+}
+if (!nzchar(STUDY)) {
+  STUDY <- if ("STUDYID" %in% names(er_all)) paste(unique(as.character(er_all$STUDYID[!is.na(er_all$STUDYID)])),collapse=", ") else NA_character_
+  STUDY <- if (is.na(STUDY)) "the study" else STUDY
+}
+if (!nzchar(INDICATION)) {
+  INDICATION <- if ("INDICATION" %in% names(er_all)) .first_ok(er_all$INDICATION) else NA_character_
+  INDICATION <- if (is.na(INDICATION)) "the study population" else INDICATION
+}
+DRUG_LOW <- strsplit(DRUG, "[[:space:]]+")[[1]][1]   # set with DRUG, above
+cat("ER_LABELS", DRUG, "|", STUDY, "|", INDICATION, "\n")
+dir.create(OUT_DIR, showWarnings = FALSE)
+write.csv(data.frame(key = c("DRUG", "STUDY", "INDICATION", "PROJECT"),
+                     value = c(DRUG, STUDY, INDICATION, STUDY), stringsAsFactors = FALSE),
+          file.path(OUT_DIR, "labels.csv"), row.names = FALSE)
+
+for (cn in c("PKFL", "EFFFL", "SAFEFL")) if (!cn %in% names(er_all)) er_all[[cn]] <- 1
+
+flag01 <- function(x) {
+  v <- toupper(trimws(as.character(x)))
+  ifelse(v %in% c("1","Y","YES","TRUE","T"),1L,ifelse(v %in% c("0","N","NO","FALSE","F"),0L,NA_integer_))
+}
+for(v in c("PKFL","EFFFL","SAFEFL")) er_all[[v]] <- flag01(er_all[[v]])
+if(!"SUBJID" %in% names(er_all) || anyNA(er_all$SUBJID) || anyDuplicated(er_all$SUBJID)) stop("ER requires one row per subject and a unique nonmissing SUBJID")
+pop_pk  <- er_all %>% filter(PKFL == 1)
+pop_eff <- er_all %>% filter(EFFFL == 1)
+pop_saf <- er_all %>% filter(SAFEFL == 1)
+
+n_all <- nrow(er_all); n_pk <- nrow(pop_pk); n_eff <- nrow(pop_eff); n_saf <- nrow(pop_saf)
+
+present <- function(v) v %in% names(er_all)
+num <- function(x) suppressWarnings(as.numeric(x))
+HAVE_EXPO <- present(PK_EXPO) && any(is.finite(num(er_all[[PK_EXPO]])))
+HAVE_EXPO_EFF <- any(is.finite(num(pop_eff[[PK_EXPO]])))
+HAVE_EOT  <- present(PK_EXPO_EOT) && any(is.finite(num(pop_eff[[PK_EXPO_EOT]])))
+
+as01 <- function(x) {
+  if (is.numeric(x)) return(ifelse(x %in% c(0,1),as.numeric(x),NA_real_))
+  s <- toupper(trimws(as.character(x)))
+  out <- suppressWarnings(as.numeric(s))
+  out[s %in% c("Y", "YES", "TRUE", "T")] <- 1
+  out[s %in% c("N", "NO", "FALSE", "F")]  <- 0
+  out[!out %in% c(0,1)] <- NA_real_
+  out
+}
+as_event <- function(x, colname) {
+  v <- as01(x)
+  source_name <- if(colname %in% names(ER_SOURCE_NAMES)) ER_SOURCE_NAMES[[colname]] else colname
+  if (grepl("CNSR|CENS", toupper(source_name))) v <- 1 - v
+  v
+}
+find_col <- function(canon, alts = NULL)
+  pick(names(er_all), unique(c(canon, alts, END_TTE_ALIAS[[canon]])))
+usable_bin <- function(var, alts = NULL) {
+  cn <- find_col(var, alts)
+  if (is.null(cn)) return(NULL)
+  v <- as01(pop_eff[[cn]]); v <- v[!is.na(v)]
+  if (length(v) < 3 || length(unique(v)) < 2) return(NULL)
+  cn
+}
+usable_tte <- function(timevar, evvar) {
+  tn <- find_col(timevar); en <- find_col(evvar)
+  if (is.null(tn) || is.null(en)) return(NULL)
+  ev <- as_event(pop_eff[[en]], en); tm <- num(pop_eff[[tn]])
+  if (sum(ev == 1, na.rm = TRUE) < 1 || sum(is.finite(tm)) < 3) return(NULL)
+  list(time = tn, event = en)
+}
+
+resolve_endpoints <- function(def = END_DEF) {
+  out <- list()
+  for (d in def) {
+    if (d$kind == "binary") {
+      cn <- usable_bin(d$var, d$alts)
+      if (is.null(cn)) { message("ER_SCHEMA_SKIP ", d$label,
+                                 " (no usable binary column ", d$var, ")"); next }
+      d$col <- cn; d$var <- cn
+      d$short <- d$short %||% tolower(gsub("[^A-Za-z0-9]", "", d$label))
+    } else {
+      hit <- usable_tte(d$timevar, d$evvar)
+      if (is.null(hit)) { message("ER_SCHEMA_SKIP ", d$label, " (no usable ",
+                                  d$timevar, "/", d$evvar, " pair)"); next }
+      d$timevar <- hit$time; d$evvar <- hit$event
+      d$short <- d$short %||% tolower(gsub("[^A-Za-z0-9]", "", d$label))
+    }
+    out[[length(out) + 1]] <- d
+  }
+  drop_if_off <- function(out, label, on) if (on) out else
+    out[!vapply(out, function(e) e$label == label, logical(1))]
+  out <- drop_if_off(out, "ORR", RUN_ORR)
+  out <- drop_if_off(out, "DoR", RUN_DOR)
+  out <- drop_if_off(out, "PFS", RUN_PFS)
+  if (isTRUE(END_AUTO)) {
+    has <- function(out, tv) any(vapply(out, function(e) e$kind == "tte" &&
+                                          e$timevar == tv, logical(1)))
+    for (e in out) {
+      if (e$kind != "binary") next
+      cand_time <- c(paste0(e$col, "TIME"), paste0(e$col, "_TIME"),
+                     paste0("T_", e$col), paste0("TIME_TO_", e$col),
+                     paste0(e$col, "DUR"), paste0(e$col, "TIM"))
+      cand_evt  <- c(paste0(e$col, "EVT"), paste0(e$col, "_EVENT"),
+                     paste0(e$col, "_EVT"), paste0(e$col, "STATUS"),
+                     paste0(e$col, "_STATUS"))
+      tn <- pick(names(er_all), cand_time); en <- pick(names(er_all), cand_evt)
+      if (is.null(tn) || is.null(en) || has(out, tn)) next
+      hit <- usable_tte(tn, en)
+      if (is.null(hit)) next
+      lab <- paste0("Time to ", e$label)
+      message("ER_SCHEMA_AUTO_TTE ", lab, " (", hit$time, "/", hit$event, ")")
+      out[[length(out) + 1]] <- list(kind = "tte", label = lab,
+                                     timevar = hit$time, evvar = hit$event,
+                                     short = tolower(gsub("[^A-Za-z0-9]", "",
+                                                          paste0("t", e$label))),
+                                     direction = "up")
+    }
+  }
+  out
+}
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+EPS <- resolve_endpoints()
+HAVE_ORR <- any(vapply(EPS, function(e) e$label == "ORR", logical(1)))
+HAVE_DOR <- any(vapply(EPS, function(e) e$label == "DoR", logical(1)))
+HAVE_PFS <- any(vapply(EPS, function(e) e$label == "PFS", logical(1)))
+HAVE_OS  <- any(vapply(EPS, function(e) e$label == "OS", logical(1)))
+if (!length(EPS)) message("ER_SCHEMA_NO_ENDPOINT: none of the declared endpoints is in ",
+                          DATA_FILE, " — the efficacy sections are omitted")
+if (!HAVE_EXPO)
+  stop("ER_SCHEMA_NO_EXPOSURE: no usable exposure metric in ", DATA_FILE,
+       "\n  looked for: ", PK_EXPO, " and ", paste(EXPO_ALIAS, collapse = ", "),
+       "\n  columns present: ", paste(names(er_all), collapse = ", "),
+       "\n  -> set PK_EXPO in the switches chunk to the study's exposure column.")
+if (LOGPK && any(num(pop_eff[[PK_EXPO]]) <= 0, na.rm = TRUE)) {
+  LOGPK <- FALSE
+  message("ER_SCHEMA_LOGPK_OFF exposure has non-positive values — modelling it untransformed")
+}
+RUN_EFFEC <- RUN_EFFEC && length(EPS) > 0 && HAVE_EXPO_EFF
+cat("ER_ENDPOINTS", paste(vapply(EPS, function(e) paste0(e$label, "(", e$kind, ")"),
+                                 character(1)), collapse = " | "), "\n")
+
+dose_label <- function(v) {
+  x <- num(v)
+  if (!length(x) || all(is.na(x))) "" else paste0(", ", max(x, na.rm = TRUE), " mg")
+}
+medrng <- function(x) {
+  x <- num(x); x <- x[!is.na(x)]
+  if (!length(x)) "n.a." else
+    paste0(er_format_coef(median(x)), " [", er_format_coef(min(x)), ", ", er_format_coef(max(x)), "]")
+}
+
+
+# Categorical reference levels
+mode_level <- function(x) {
+  x <- as.character(x); x <- x[!is.na(x)]
+  if (!length(x)) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[[1]]
+}
+cat_counts <- function(d, v) {
+  lv <- as.character(d[[v]]); lv <- lv[!is.na(lv)]
+  if (!length(lv))
+    return(data.frame(level = character(0), N = integer(0), rank = integer(0),
+                      stringsAsFactors = FALSE))
+  tb <- sort(table(lv), decreasing = TRUE)
+  data.frame(level = names(tb), N = as.integer(tb), rank = seq_along(tb),
+             stringsAsFactors = FALSE)
+}
+# Fitted reference level
+cat_ref_level <- function(d, v, fit = NULL) {
+  if (!is.null(fit)) {
+    mf <- tryCatch(stats::model.frame(fit), error = function(e) NULL)
+    if (!is.null(mf) && v %in% names(mf) && is.factor(mf[[v]])) return(levels(mf[[v]])[1])
+  }
+  x <- d[[v]]
+  lv <- if (is.factor(x)) levels(x) else levels(factor(as.character(x)))
+  if (length(lv)) lv[1] else NA_character_
+}
+# Coefficient level
+cat_level_of_term <- function(d, v, term) {
+  x <- d[[v]]
+  lvls <- if (is.factor(x)) levels(x) else levels(factor(as.character(x)))
+  cand <- lvls[vapply(lvls, function(l) identical(paste0(v, l), as.character(term)),
+                      logical(1))]
+  if (length(cand)) return(cand[which.max(nchar(cand))])
+  sub(paste0("^", v), "", as.character(term))
+}
+# "<level> : <reference> (N = n : n_ref)" - the numbers are read off the data frame.
+cat_effect_label <- function(d, v, level, ref = NULL, fit = NULL) {
+  if(!is.null(fit)) {mf <- model.frame(fit); d <- d[match(rownames(mf),rownames(d)),,drop=FALSE]}
+  cc <- cat_counts(d, v)
+  if (is.null(ref)) ref <- cat_ref_level(d, v, fit)
+  n_of <- function(l) {
+    i <- which(cc$level == as.character(l))
+    if (length(i)) cc$N[i[1]] else NA_integer_
+  }
+  sprintf("%s : %s (N = %d : %d)", cat_level_display(v, level), cat_level_display(v, ref),
+          n_of(level), n_of(ref))
+}
+ref_wanted <- function(v) {
+  if (is.null(COV_REF) || !length(COV_REF)) return("modal")
+  if (length(COV_REF) == 1 && (is.null(names(COV_REF)) || !nzchar(names(COV_REF)[1]))) return(as.character(COV_REF)[1])
+  if (v %in% names(COV_REF)) return(as.character(COV_REF[[v]]))
+  "modal"
+}
+# The printed name of a categorical level (COV_LEVELS map; unlisted levels print as-is).
+cat_level_display <- function(v, l) {
+  m <- COV_LEVELS[[v]]
+  l <- as.character(l)
+  hit <- match(l, names(m))
+  ifelse(is.na(hit), l, as.character(m[hit]))
+}
+# Factor reference levels
+set_cat_ref <- function(d, vars, ref = NULL) {
+  releveled <- character(0)
+  for (v in intersect(vars, names(d))) {
+    x <- d[[v]]
+    if(!v %in% CAT_COV) next
+    f <- factor(as.character(x))
+    if (nlevels(f) < 2) { d[[v]] <- f; next }
+    want <- if(is.null(ref)) ref_wanted(v) else if(!is.null(names(ref))) if(v %in% names(ref)) as.character(ref[[v]]) else "modal" else as.character(ref)[1]
+    top  <- if (identical(want, "modal")) mode_level(f) else {
+      if (want %in% levels(f)) want else {
+        message("ER_SCHEMA_REF_UNKNOWN ", v, ": COV_REF level '", want,
+                "' is not in the data - using the most frequent level")
+        mode_level(f)
+      }
+    }
+    if (!is.na(top)) {
+      if (levels(f)[1] != top) releveled[v] <- levels(f)[1]               # old reference
+      f <- stats::relevel(f, ref = top)
+    }
+    d[[v]] <- f
+  }
+  list(data = d, releveled = releveled)
+}
+check_cat_ref <- function(d, vars, fit = NULL) {
+  if(!is.null(fit)) d <- d[match(rownames(model.frame(fit)),rownames(d)),,drop=FALSE]
+  for (v in intersect(vars, names(d))) {
+    rx <- d[[v]]
+    if (is.numeric(rx) && length(unique(stats::na.omit(rx))) > 2) next
+    cc <- cat_counts(d, v)
+    if (!nrow(cc)) next
+    rr <- cat_ref_level(d, v, fit)
+    if (!is.na(rr) && !identical(as.character(rr), as.character(cc$level[1])))
+      message("ER_SCHEMA_REF_NOT_LARGEST ", v, ": model reference '", rr,
+              "' is not the most frequent level '", cc$level[1],
+              "' - re-check the plot labels for this covariate")
+  }
+}
+
+derive <- function(d) {
+  d[[EXPO2]] <- if(HAVE_EXPO) if(LOGPK) log(num(d[[PK_EXPO]])) else num(d[[PK_EXPO]]) else rep(NA_real_,nrow(d))
+  d$LCavg_EOT <- if(HAVE_EOT) if(LOGPK) log(num(d[[PK_EXPO_EOT]])) else num(d[[PK_EXPO_EOT]]) else rep(NA_real_,nrow(d))
+  # Derived covariates
+  for (v in names(COV_DERIVE)) {
+    val <- tryCatch(COV_DERIVE[[v]](d), error = function(e) e)
+    if (inherits(val, "error")) {
+      message("ER_SCHEMA_DERIVE_SKIP ", v, ": ", conditionMessage(val)); next
+    }
+    if (length(val) != nrow(d)) {
+      message("ER_SCHEMA_DERIVE_SKIP ", v, ": length ", length(val), " != ", nrow(d)); next
+    }
+    d[[v]] <- val
+  }
+  if (!"WGTRL" %in% names(d)) d$WGTRL <- num(d[["WC"]])
+  set_cat_ref(d, CAT_COV)$data                           # reference from COV_REF
+}
+EXPO2   <- if (LOGPK) paste0("L", PK_EXPO) else PK_EXPO
+pop_eff <- derive(pop_eff)
+pop_saf <- derive(pop_saf)
+
+cat("subjects read:", n_all, "| PK:", n_pk, "| efficacy:", n_eff, "| safety:", n_saf, "\n")
+cat("exposure:", PK_EXPO, "| endpoints:", length(EPS), "| regression:", RUN_REGRESSION, "\n")
+```
+
+```{r helper-functions}
+
+cut_exposure <- function(dat, var, n_quantile = N_QUANTILE) {
+  x <- suppressWarnings(as.numeric(dat[[var]]))
+  if (all(is.na(x))) stop("ER_SCHEMA_CUT: exposure column '", var, "' is empty.")
+  brks <- unique(as.numeric(quantile(x, probs = seq(0, 1, 1 / n_quantile), na.rm = TRUE)))
+  if (length(brks) < 3)
+    stop("ER_SCHEMA_EXPO_TIES: only ", length(brks), " distinct cut point(s) in '",
+         var, "' — too tied for quantile groups.")
+  k <- length(brks) - 1
+  prefix <- switch(as.character(k), "2" = "H", "3" = "T", "Q")
+  labs <- paste0(prefix, seq_len(k), " [", er_format_coef(brks[-length(brks)]),
+                 "-", er_format_coef(brks[-1]), "]")
+  dat[[var]] <- cut(x, breaks = brks, include.lowest = TRUE, labels = labs)
+  dat
+}
+
+plot.rate <- function(dat, yvar, yvar.lab, xvar = PK_EXPO,
+                      xlab = paste0(PK_EXPO_LAB, " Quartiles"),
+                      n_quantile = N_QUANTILE, col = NULL, dose_text = TRUE) {
+  dat <- cut_exposure(dat, xvar, n_quantile)
+  mat    <- tapply(dat[[yvar]], dat[[xvar]], mean, na.rm = TRUE) * 100
+  mat.d  <- table(dat[[xvar]])
+  mat.n  <- tapply(dat[[yvar]], dat[[xvar]], sum, na.rm = TRUE)
+  mat.sd <- sqrt(mat * (100 - mat) / 100 / 100 / mat.d) * 100
+  n.x <- length(levels(dat[[xvar]])) + 1
+  if (is.null(col)) col <- c("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
+  dose_lines <- character()
+  if(dose_text && DOSE_VAR %in% names(dat) && length(unique(na.omit(dat[[DOSE_VAR]])))>1) {
+    doses <- sort(unique(na.omit(dat[[DOSE_VAR]])))
+    labels <- vapply(doses,function(d) {
+      v <- dat[[yvar]][dat[[DOSE_VAR]]==d & !is.na(dat[[yvar]])]
+      sprintf("%s: %.1f%% (%d/%d)",d,100*mean(v),sum(v),length(v))
+    },"")
+    dose_lines <- unlist(lapply(labels,function(label)
+      strwrap(paste0(REG_LABEL,": ",label),width=85)),use.names=FALSE)
+  }
+  old_par <- par(no.readonly=TRUE)
+  on.exit(par(old_par),add=TRUE)
+  par(mar=c(5.1,4.1,max(1.5,length(dose_lines)+2),2.1),xpd=FALSE)
+  ymax <- max(110,mat+mat.sd+15,na.rm=TRUE)
+  plot(c(0.45,n.x-0.45),c(0,ymax),type="n",axes=FALSE,
+       ylab=paste0(yvar.lab," (%)"),xlab=xlab,cex.lab=1.3)
+  axis(1,seq(1,n.x-1,1),lab=levels(dat[[xvar]]),cex.axis=1)
+  axis(2,at=seq(0,100,20))
+  delta <- 0.38
+  for(i in seq_len(n.x-1)) {
+    polygon(c(i-delta,i+delta,i+delta,i-delta),
+            c(0,0,mat[i],mat[i]),density=-10,col=col[i],border=col[i])
+    segments(x0=i,y0=mat[i],x1=i,y1=mat[i]+mat.sd[i],col=col[i])
+    segments(x0=i-delta+.2,x1=i+delta-.2,y0=mat[i]+mat.sd[i],col=col[i])
+    text(i,mat[i]+mat.sd[i]+12,paste0(round(mat[i],1),"%"),cex=1)
+    text(i,mat[i]+mat.sd[i]+5,paste0("(",mat.n[i],"/",mat.d[i],")"),cex=1)
+  }
+  if(length(dose_lines)) mtext(dose_lines,side=3,
+    line=.8+rev(seq_along(dose_lines)-1),adj=0,cex=.85,xpd=NA)
+}
+
+plot.logi <- function(dat, expo_par = PK_EXPO, x_lab = PK_EXPO_LAB,
+                      ev_var = "ORR", y_lab = "ORR (%)", reg = NA,
+                      reg_lab = "Dose (mg QD)", n_quantile = N_QUANTILE,
+                      logpk = LOGPK, curve = NULL) {
+  dat1 <- dat %>% mutate(EXPO = .data[[expo_par]], Res = .data[[ev_var]])
+  bin_df <- dat1 %>%
+    mutate(bin = ntile(EXPO, n_quantile)) %>%
+    group_by(bin) %>%
+    summarise(expo_mid = median(EXPO, na.rm = TRUE),
+              rate = mean(Res, na.rm = TRUE),
+              N_R = sum(Res, na.rm = TRUE), N = dplyr::n(),
+              Lower = binom.test(N_R, N)$conf.int[1],
+              Upper = binom.test(N_R, N)$conf.int[2],
+              .groups = "drop")
+  model_exposure <- if(logpk) log(dat1$EXPO) else dat1$EXPO
+  if(is.null(curve)) {
+    model_data <- transform(dat1,EXPO_FIT=model_exposure)
+    curve <- tryCatch(pmx_regression_checked(glm(Res~EXPO_FIT,data=model_data,family=binomial)),
+      error=function(e) {message("ER_LOGISTIC_CURVE_UNAVAILABLE: ",conditionMessage(e));NULL})
+  }
+  p_top <- ggplot(dat1, aes(x = EXPO, y = Res)) +
+    geom_point(alpha = 0.7, shape = 1) +
+    geom_point(data = bin_df, aes(x = expo_mid, y = rate), size = 2, col = "red", inherit.aes = FALSE) +
+    geom_errorbar(data = bin_df, aes(x = expo_mid, ymin = Lower, ymax = Upper), inherit.aes = FALSE) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    labs(x = x_lab, y = y_lab) + theme_bw()
+  if(!is.null(curve)) {
+    fit_x <- seq(min(model_exposure),max(model_exposure),length.out=100)
+    grid <- setNames(data.frame(fit_x),attr(terms(curve),"term.labels"))
+    pred <- predict(curve,newdata=grid,type="link",se.fit=TRUE)
+    grid$EXPO <- if(logpk) exp(fit_x) else fit_x
+    grid$rate <- plogis(pred$fit);grid$lower <- plogis(pred$fit-qnorm(.975)*pred$se.fit);grid$upper <- plogis(pred$fit+qnorm(.975)*pred$se.fit)
+    p_top <- p_top + geom_ribbon(data=grid,aes(x=EXPO,ymin=lower,ymax=upper),inherit.aes=FALSE,alpha=.15) +
+      geom_line(data=grid,aes(x=EXPO,y=rate),inherit.aes=FALSE,colour="red")
+  } else p_top <- p_top + labs(caption="Logistic curve unavailable: convergence or estimability checks failed; observed summaries are retained.")
+  if (logpk) p_top <- p_top + scale_x_log10(labels = scales::label_number())
+
+  if (is.na(reg)[1]) return(p_top)
+
+  p_bottom <- ggplot(dat1 %>% mutate(Regf = droplevels(as.factor(.data[[reg]]))),
+                     aes(x = Regf, y = EXPO)) +
+    geom_boxplot() + coord_flip() +
+    labs(x = reg_lab, y = x_lab) +
+    theme_bw()
+  if (logpk) p_bottom <- p_bottom + scale_y_log10(labels = scales::label_number())
+
+  plot_grid(p_top + theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+                          axis.ticks.x = element_blank()),
+            p_bottom, align = "v", ncol = 1, rel_heights = c(2.4, 1))
+}
+
+km.plot <- function(dat, pkvar = PK_EXPO_EOT, timevar = "DORMIN", evvar = "DOREVT",
+                    xlab = "Time (Months)", ylab = NULL,
+                    direction = c("down", "up"), legendx = 0.17, legedy = 0.2,
+                    legend = pkvar, n_quantile = N_QUANTILE,
+                    risk.table = TRUE, break.x.by = 5) {
+  direction <- match.arg(direction)
+  if (is.null(ylab))
+    ylab <- if (direction == "down") "Survival probability"
+            else "Cumulative event probability"
+  dat <- cut_exposure(dat, pkvar, n_quantile)
+  fml <- as.formula(paste0("Surv(time=", timevar, ", event=", evvar, ") ~", pkvar))
+  KM_dat <- survfit(fml, data = dat)
+  KM_dat$call$formula <- fml
+  ggsurvplot(KM_dat, data = dat, fun = if (direction == "up") "event" else NULL,
+             risk.table = risk.table, break.x.by = break.x.by,
+             xlab = xlab, ylab = ylab,
+             legend.labs = levels(dat[[pkvar]]), legend.title = legend,
+             legend = c(legendx, legedy),
+             tables.height = 0.2, tables.theme = theme_cleantable(),
+             risk.table.y.text = FALSE, risk.table.pos = "out")
+}
+
+est_table <- function(fit, se_col = "Std. Error") {
+  est <- coef(fit); se <- summary(fit)$coefficients[, se_col]
+  data.frame(EST = est, SE = se, CI_LB = est - 1.96 * se, CI_UB = est + 1.96 * se) %>%
+    mutate(p = 2 * pnorm(-abs(EST / SE)),
+           BIC = BIC(fit))
+}
+
+glm_fitter <- function(df, response) {
+  f <- function(rhs, data = df) {
+    form <- as.formula(paste(response,"~",rhs))
+    vars <- all.vars(form)
+    d <- data[complete.cases(data[,vars,drop=FALSE]),,drop=FALSE]
+    d <- set_cat_ref(d,intersect(CAT_COV,vars))$data
+    pmx_regression_checked(glm(form,data=d,family=binomial,na.action=na.fail))
+  }
+  attr(f, "se_col") <- "Std. Error"
+  f
+}
+cox_fitter <- function(df, timevar, evvar) {
+  f <- function(rhs) {
+    form <- as.formula(paste0("Surv(",timevar,",",evvar,") ~ ",rhs))
+    vars <- all.vars(form); d <- df[complete.cases(df[,vars,drop=FALSE]),,drop=FALSE]
+    d <- set_cat_ref(d,intersect(CAT_COV,vars))$data
+    pmx_regression_checked(coxph(form,data=d,model=TRUE))
+  }
+  attr(f, "se_col") <- "se(coef)"
+  f
+}
+
+all_cov_of <- function(df) {
+  cand <- setdiff(intersect(ALL_COV, names(df)), c(PK_EXPO, EXPO2))
+  keep <- vapply(cand, function(v) {
+    x <- df[[v]]; x <- x[!is.na(x)]
+    length(x) >= 3 && length(unique(x)) >= 2
+  }, logical(1))
+  dropped <- cand[!keep]
+  if (length(dropped)) message("ER_SCHEMA_COV_DROP ", paste(dropped, collapse = ", "))
+  cand[keep]
+}
+
+er_method_text <- function() {
+  exposure <- if(LOGPK) "log(Exposure_i)" else "Exposure_i"
+  c("Graphical analyses were conducted to explore the relationships between PK exposure metrics and clinical endpoints.",
+    "Logistic regression was used for binary endpoints, and Cox proportional hazards model was applied for time-to-event endpoints.",
+    "Logistic regression model is shown as follows:",
+    paste0("logit(P_i) = β0 + β1 × ",exposure," + β2 × COV_i"),
+    "P_i: Individual probability of event for patient i",
+    "β0: Intercept parameter representing the baseline log-odds of event",
+    paste0("β1: Slope parameter describing the effect of ",exposure," on the log-odds of event"),
+    "β2: Slope parameter describing the effect of covariate on the log-odds of event",
+    "COV_i: Covariate value for patient i",
+    "Cox proportional hazards model is shown as follows:",
+    paste0("h(t) = h0(t) × exp(β1 × ",exposure," + β2 × COV_i)"),
+    "h(t): The hazard function at time t",
+    "h0(t): The baseline hazard function at time t",
+    paste0("β1: Slope parameter describing the effect of ",exposure," on hazard"),
+    "β2: Slope parameter describing the effect of covariate on hazard",
+    "COV_i: Covariate value for patient i",
+    "Covariate terms are omitted from the exposure-only base model. For multiple covariates, β2 × COV_i represents the corresponding sum of coefficient-covariate products.")
+}
+er_safety_method <- function() {
+  if(!isTRUE(RUN_SAFETY)) return(character())
+  c("Safety exposure curves show exploratory unadjusted logistic fits.",
+    if(isTRUE(RUN_REGRESSION) && length(SAFETY_MODEL_ENDPOINTS))
+      "Prespecified binary safety endpoints in the safety population were assessed using exposure-only models and stepwise covariate selection where estimable.")
+}
+er_covariate_method <- function() {
+  if (!isTRUE(RUN_REGRESSION)) return("Regression and covariate screening were disabled.")
+  candidates <- ALL_COV
+  labels <- COV_LABEL[candidates]
+  labels[is.na(labels)] <- candidates[is.na(labels)]
+  c(if(length(candidates)) paste0("Configured screening candidates were ", paste(labels, collapse=", "), ".")
+    else "The analysis specified no covariate screening candidates.",
+    if(length(candidates)) "Each evaluable candidate was compared with its exposure-only model on matching records. BIC guided selection.",
+    if(length(candidates) && !is.na(SCREEN_P)) paste0("Screening additionally required p < ",SCREEN_P,"."),
+    if(isTRUE(RUN_SAFETY) && length(SAFETY_MODEL_ENDPOINTS))
+      paste0("For designated binary safety endpoints, exposure was retained during forward addition and backward elimination. Nested models were compared on matching records using BIC",
+        if(!is.na(SCREEN_P)) " and a likelihood-ratio test" else "", "."))
+}
+
+screen_model <- function(df, fitter, expo = EXPO2, covariates = all_cov_of(df)) {
+  se_col <- attr(fitter, "se_col")
+  base_fit <- fitter(expo)
+  if(inherits(base_fit,"glm") && !isTRUE(base_fit$converged)) stop("Base regression did not converge")
+  if(any(!is.finite(coef(base_fit)))) stop("Base regression has nonfinite/aliased coefficients")
+  base_tab <- est_table(base_fit, se_col)
+  failed <- character()
+  rows <- lapply(covariates, function(v) {
+    f <- tryCatch(fitter(paste(expo, "+", v)), error = function(e) {
+      message("ER_CANDIDATE_UNUSABLE ",v,": ",conditionMessage(e));failed <<- c(failed,v);NULL })
+    if(!is.null(f) && inherits(f,"glm") && !isTRUE(f$converged)) f <- NULL
+    if(!is.null(f) && any(!is.finite(coef(f)))) f <- NULL
+    if (is.null(f)) {failed <<- union(failed,v);return(NULL)}
+    e <- tryCatch(est_table(f, se_col), error = function(e) NULL)
+    if (is.null(e) || nrow(e) <= nrow(base_tab)) {failed <<- union(failed,v);return(NULL)}
+    e <- tail(e, nrow(e) - nrow(base_tab))
+    mf <- model.frame(f)
+    same_base <- tryCatch(pmx_regression_checked(update(f,formula=as.formula(paste(deparse(formula(f)[[2]]),"~",expo)),data=df[match(rownames(mf),rownames(df)),,drop=FALSE])),error=function(e) NULL)
+    if(is.null(same_base) || nrow(model.frame(same_base))!=nrow(mf)) {failed <<- union(failed,v);return(NULL)}
+    e$REFERENCE_BIC <- BIC(same_base)
+    e$N_ANALYSED <- nrow(mf)
+    e$covariate <- v
+    e$Comparison <- if(v %in% CAT_COV) vapply(rownames(e),function(term) cat_effect_label(df,v,cat_level_of_term(df,v,term),fit=f),"") else "continuous"
+    e
+  })
+  rows <- rows[!vapply(rows, is.null, logical(1))]
+  if (!length(rows)) {
+    return(list(base = base_fit, univ = NULL, full = base_fit, retained = character(0),failed=unique(failed),assessment=if(length(failed)) "partial" else "complete"))
+  }
+  univ <- do.call(rbind, rows)
+  univ$BIC <- univ$BIC
+  univ <- univ %>%
+    mutate(DELTA_BIC = round(BIC - REFERENCE_BIC, 1),
+           Retained = ifelse(BIC < REFERENCE_BIC &
+                               (is.na(SCREEN_P) | p < SCREEN_P), "Yes", "No")) %>%
+    # Order by selection and change in BIC
+    arrange(desc(Retained == "Yes"), DELTA_BIC, BIC, covariate)
+  kept <- univ$covariate[univ$Retained == "Yes"]
+  kept <- unique(kept)
+  full_fit <- if(length(kept)) fitter(paste(c(expo, kept), collapse = " + ")) else base_fit
+  if(inherits(full_fit,"glm") && !isTRUE(full_fit$converged)) stop("Final regression did not converge")
+  if(any(!is.finite(coef(full_fit)))) stop("Final regression has nonfinite/aliased coefficients")
+  list(base = base_fit, univ = univ, full = full_fit, retained = kept,failed=unique(failed),assessment=if(length(failed)) "partial" else "complete")
+}
+
+er_safety_scm <- function(df, fitter, expo = EXPO2, covariates = all_cov_of(df)) {
+  fit <- function(terms, data=df) fitter(paste(c(expo,terms),collapse=" + "),data)
+  base <- fit(character())
+  final <- base
+  retained <- failed <- character()
+  trials <- list()
+
+  compare <- function(v, direction) {
+    adding <- direction == "Forward"
+    reduced_terms <- if(adding) retained else setdiff(retained,v)
+    full_terms <- if(adding) c(retained,v) else retained
+    sample <- df[match(rownames(model.frame(final)),rownames(df)),,drop=FALSE]
+    if(adding) sample <- sample[!is.na(sample[[v]]),,drop=FALSE]
+    candidate <- reference <- NULL
+    error <- tryCatch({
+      if(min(table(factor(model.response(model.frame(final)),levels=0:1))) < 3L)
+        stop("Insufficient events or non-events")
+      if(adding) {
+        reference <- if(nrow(sample)==nobs(final)) final else fit(reduced_terms,sample)
+        candidate <- fit(full_terms,sample)
+      } else {
+        reference <- final
+        candidate <- fit(reduced_terms,sample)
+      }
+      if(!identical(rownames(model.frame(candidate)),rownames(model.frame(reference))))
+        stop("Candidate and reference model samples differ")
+      y <- model.response(model.frame(candidate))
+      if(min(table(factor(y,levels=0:1))) < 3L) stop("Insufficient events or non-events")
+      ""
+    },error=function(e) conditionMessage(e))
+    if(nzchar(error)) failed <<- union(failed,v)
+    bic <- reference_bic <- p <- NA_real_
+    if(!nzchar(error)) {
+      bic <- BIC(candidate)
+      reference_bic <- BIC(reference)
+      small <- if(adding) reference else candidate
+      large <- if(adding) candidate else reference
+      p <- as.numeric(anova(small,large,test="LRT")[2,"Pr(>Chi)"])
+    }
+    list(fit=candidate,row=data.frame(Step=length(trials)+1L,Direction=direction,
+      Covariate=v,N=nrow(sample),BIC=bic,Reference_BIC=reference_bic,Delta_BIC=bic-reference_bic,
+      P=p,Selected=FALSE,Issue=error))
+  }
+
+  for(direction in c("Forward","Backward")) repeat {
+    candidates <- if(direction=="Forward") setdiff(covariates,retained) else retained
+    if(!length(candidates)) break
+    results <- lapply(candidates,compare,direction=direction)
+    rows <- do.call(rbind,lapply(results,function(x) x$row))
+    pass <- !is.na(rows$Delta_BIC) & rows$Delta_BIC < 0
+    if(!is.na(SCREEN_P)) {
+      p_pass <- if(direction=="Forward") rows$P < SCREEN_P else rows$P >= SCREEN_P
+      pass <- pass & !is.na(rows$P) & p_pass
+    }
+    winner <- which(pass)[which.min(rows$Delta_BIC[pass])]
+    if(length(winner)) rows$Selected[winner] <- TRUE
+    trials[[length(trials)+1L]] <- rows
+    if(!length(winner)) break
+    v <- rows$Covariate[winner]
+    if(direction=="Forward") {
+      retained <- c(retained,v)
+      final <- results[[winner]]$fit
+    } else {
+      retained <- setdiff(retained,v)
+      candidate <- results[[winner]]$fit
+      refreshed <- tryCatch(fit(retained),error=function(e) NULL)
+      final <- if(is.null(refreshed)) candidate else refreshed
+    }
+  }
+  list(base=base,full=final,univ=NULL,scm=do.call(rbind,trials),retained=retained,
+       failed=failed,assessment=if(length(failed)) "partial" else "complete")
+}
+
+er_scm_table <- function(rows) {
+  if(is.null(rows)) return(NULL)
+  data.frame(Step=rows$Step, Direction=rows$Direction,
+    Covariate=vapply(rows$Covariate,cov_lab,""), N=rows$N,
+    BIC=er_format_coef(rows$BIC), "Reference BIC"=er_format_coef(rows$Reference_BIC),
+    "Delta BIC"=er_format_coef(rows$Delta_BIC), "LRT p"=er_format_coef(rows$P,3),
+    Selected=ifelse(rows$Selected,"Yes","No"), Issue=rows$Issue,check.names=FALSE)
+}
+
+er_format_coef <- function(x,digits=2) {
+  vapply(x,function(value) {
+    if(!is.finite(value)) return("NE")
+    a <- abs(value)
+    if(a==0) return("0")
+    if(a<0.0001) return(sub("e([+-])0+","e\\1",formatC(value,digits=digits-1,format="e")))
+    places <- if(a>=1) digits else max(digits,digits-1-floor(log10(a)))
+    text <- formatC(value,digits=places,format="f")
+    text <- sub("0+$","",text);sub("\\.$","",text)
+  },"",USE.NAMES=FALSE)
+}
+er_full_equals_base <- function(scr) {
+  !is.null(scr) && !length(scr$retained) &&
+    identical(deparse(formula(scr$base)),deparse(formula(scr$full))) &&
+    identical(rownames(model.frame(scr$base)),rownames(model.frame(scr$full))) &&
+    isTRUE(all.equal(coef(scr$base),coef(scr$full),tolerance=1e-12))
+}
+er_result_placeholder <- function(ep,kind="graphical") paste0("[",
+  if(kind=="graphical") "Exposure-response trend" else "Regression effects",
+  " for ",ep$label,": interpretation pending.]")
+er_assessment_text <- function(scr) if(length(scr$failed)) paste0("Covariate assessment was incomplete: ",paste(scr$failed,collapse=", ")," could not be evaluated; failure is not evidence of no effect.") else character()
+er_same_model_text <- function(scr) {
+  if(length(scr$failed)) return(paste(er_assessment_text(scr),"The reported full model has the base structure."))
+  has_screening <- nrow(scr$univ %||% scr$scm %||% data.frame()) > 0L
+  if(!has_screening)
+    "No evaluable covariate-screening results were available. The full model is the same as the base model."
+  else "No covariates met the configured selection criteria. The full model is the same as the base model."
+}
+er_term_label <- function(x) {
+  out <- as.character(x)
+  out[out==EXPO2] <- if(LOGPK) paste0("Log(",PK_EXPO,")") else PK_EXPO
+  out
+}
+er_comparison_label <- function(x) sub("\\s*\\(N\\s*=.*\\)\\s*$","",x,perl=TRUE)
+
+er_kable <- function(d,...) {
+  prefixes <- attr(d,"bold_labels")
+  shown <- d
+  shown[] <- lapply(shown,function(x) { x <- as.character(x);x[is.na(x)] <- "";htmltools::htmlEscape(x) })
+  label_column <- intersect(c("Covariate","Parameter"),names(shown))[1]
+  if(!is.na(label_column)) {
+    indented <- which(startsWith(as.character(d[[label_column]]),"\u00a0"))
+    for(i in indented) shown[[label_column]][i] <- paste0('<span data-indent="1" style="padding-left:1ch">',
+      htmltools::htmlEscape(sub("^\u00a0","",as.character(d[[label_column]][i]))),'</span>')
+    if(length(prefixes)) for(i in seq_len(nrow(shown))) {
+      prefix <- prefixes[i]
+      if(!is.na(prefix) && nzchar(prefix) && startsWith(as.character(d[[label_column]][i]),prefix)) {
+        rest <- substring(as.character(d[[label_column]][i]),nchar(prefix)+1)
+        shown[[label_column]][i] <- paste0("<strong>",htmltools::htmlEscape(prefix),"</strong>",htmltools::htmlEscape(rest))
+      }
+    }
+  }
+  knitr::kable(shown,format="html",escape=FALSE,row.names=FALSE,...)
+}
+
+er_covariate_label <- function(v,var_meta,with_unit=FALSE) {
+  i <- match(v,var_meta$orig_var)
+  label <- as.character(var_meta$display[i])
+  if(is.na(label) || !nzchar(label)) label <- gsub("_"," ",v)
+  unit <- as.character(var_meta$unit[i])
+  paste0(label,if(with_unit && !is.na(unit) && nzchar(unit)) paste0(" (",unit,")") else "")
+}
+
+er_model_term_labels <- function(fit,var_meta=ep_var_meta()) {
+  terms <- names(coef(fit));labels <- er_term_label(terms);df <- model.frame(fit)
+  candidates <- intersect(unique(c(CON_COV,CAT_COV)),names(df))
+  for(i in seq_along(terms)) {
+    term <- terms[i]
+    if(term %in% c("(Intercept)",EXPO2,PK_EXPO)) next
+    hits <- candidates[vapply(candidates,function(v)
+      if(v %in% CAT_COV) startsWith(term,v) else identical(term,v),logical(1))]
+    if(!length(hits)) next
+    variable <- hits[which.max(nchar(hits))]
+    categorical <- variable %in% CAT_COV
+    labels[i] <- cov_lab(variable)
+    if(categorical) labels[i] <- paste(labels[i],
+      er_comparison_label(cat_effect_label(df,variable,cat_level_of_term(df,variable,term),fit=fit)),sep="\n")
+  }
+  setNames(labels,terms)
+}
+
+model_out <- function(fit, se_col, effect = c("OR", "HR"), digits = 2) {
+  effect <- match.arg(effect)
+  est <- coef(fit); se <- summary(fit)$coefficients[,se_col]
+  format_coef <- function(x) er_format_coef(x,digits)
+  lb <- est-qnorm(0.975)*se; ub <- est+qnorm(0.975)*se
+  tab <- data.frame(Parameter=unname(er_model_term_labels(fit)),Estimate=format_coef(est),
+    `SE (RSE%)`=paste0(format_coef(se)," (",round(100*se/abs(est),1),")"),
+    `95% CI`=paste0(format_coef(lb)," to ",format_coef(ub)),
+    `P value`=format.pval(2*pnorm(-abs(est/se)),digits=2,eps=0.001),
+    check.names=FALSE,row.names=NULL)
+  df <- model.frame(fit);variables <- intersect(CAT_COV,names(df))
+  rows <- list();bold_labels <- character();seen <- character()
+  for(i in seq_len(nrow(tab))) {
+    term <- names(est)[i]
+    matches <- variables[vapply(variables,function(v) startsWith(term,v),TRUE)]
+    variable <- if(length(matches) && !term %in% c(EXPO2,PK_EXPO)) matches[which.max(nchar(matches))] else ""
+    row <- tab[i,,drop=FALSE]
+    if(nzchar(variable)) {
+      label <- cov_lab(variable)
+      if(!variable %in% seen) {
+        header <- row;header[] <- "";header$Parameter <- label
+        rows[[length(rows)+1L]] <- header;bold_labels <- c(bold_labels,label);seen <- c(seen,variable)
+      }
+      row$Parameter <- paste0("\u00a0",er_comparison_label(
+        cat_effect_label(df,variable,cat_level_of_term(df,variable,term),fit=fit)))
+      bold_labels <- c(bold_labels,"")
+    } else bold_labels <- c(bold_labels,if(term %in% CON_COV) cov_lab(term) else "")
+    rows[[length(rows)+1L]] <- row
+  }
+  out <- do.call(rbind,rows);rownames(out) <- NULL;attr(out,"bold_labels") <- bold_labels;out
+}
+
+covariate_summary <- function(screened, kind = c("Logistic", "Cox"), endpoint) {
+  kind <- match.arg(kind)
+  u <- screened$univ
+  if (is.null(u) || !nrow(u)) return(NULL)
+  out <- data.frame(
+    Endpoint  = endpoint,
+    Model     = kind,
+    Covariate = ifelse(u$Comparison=="continuous",u$covariate,paste(u$covariate,u$Comparison,sep="\n")),
+    Estimate  = er_format_coef(u$EST),
+    SE        = er_format_coef(u$SE),
+    `95% CI`  = paste0(er_format_coef(u$CI_LB), " to ", er_format_coef(u$CI_UB)),
+    `P value` = format.pval(u$p, digits = 2, eps = 0.001),
+    `Effect (95% CI)` = paste0(round(exp(u$EST), 2), " (", round(exp(u$CI_LB), 2),
+                               " - ", round(exp(u$CI_UB), 2), ")"),
+    `Delta BIC` = u$DELTA_BIC,
+    Retained    = u$Retained,
+    check.names = FALSE, stringsAsFactors = FALSE)
+  out$`Effect type` <- if (kind == "Logistic") "Odds ratio" else "Hazard ratio"
+  out[, c("Endpoint", "Model", "Covariate", "Estimate", "SE", "95% CI", "P value",
+          "Effect type", "Effect (95% CI)", "Delta BIC", "Retained")]
+}
+
+coveff_table <- function(fit,df,se_col,effect=c("OR","HR"),pk_expo=PK_EXPO,
+                         logpk=LOGPK,var_meta) {
+  effect <- match.arg(effect);ce <- est_table(fit,se_col)
+  ce <- ce[rownames(ce)!="(Intercept)",,drop=FALSE]
+  candidates <- unique(c(con_cov_glob,cat_cov_glob))
+  label_of <- function(v) er_covariate_label(v,var_meta)
+  rows <- list()
+  append_effect <- function(term,label,estimate,se,delta,type) {
+    logeff <- estimate*delta;logse <- abs(delta)*se
+    values <- exp(logeff+c(0,-1,1)*qnorm(.975)*logse)
+    if(any(!is.finite(values)) || any(values<=0)) return(invisible(NULL))
+    rows[[length(rows)+1L]] <<- data.frame(rowname=term,label=label,Eff=values[1],
+      Eff_LB=values[2],Eff_UB=values[3],
+      eff_text=paste0(er_format_coef(values[1])," (",er_format_coef(values[2])," - ",er_format_coef(values[3]),")"),
+      var_type=type,stringsAsFactors=FALSE)
+  }
+  for(i in seq_len(nrow(ce))) {
+    term <- rownames(ce)[i]
+    if(!is.finite(ce$EST[i]) || !is.finite(ce$SE[i])) next
+    exposure <- term %in% c(EXPO2,pk_expo)
+    hits <- candidates[startsWith(term,candidates)]
+    variable <- if(exposure) pk_expo else if(length(hits)) hits[which.max(nchar(hits))] else NA_character_
+    if(is.na(variable) || !variable %in% names(df)) stop("Cannot map fitted forest term: ",term)
+    categorical <- !exposure && variable %in% cat_cov_glob
+    if(categorical) {
+      level <- cat_level_of_term(df,variable,term)
+      check_cat_ref(df,variable,fit=fit)
+      label <- paste(label_of(variable),cat_effect_label(df,variable,level,fit=fit),sep="\n")
+      append_effect(term,label,ce$EST[i],ce$SE[i],1,"categorical")
+    } else {
+      x <- num(df[[variable]]); x <- x[is.finite(x)]
+      if(length(x)<3L || (exposure && logpk && any(x<=0))) next
+      quantiles <- as.numeric(quantile(x,c(.05,.5,.95),na.rm=TRUE))
+      title <- er_covariate_label(variable,var_meta,with_unit=TRUE)
+      for(j in c(1L,3L)) {
+        delta <- if(exposure && logpk) log(quantiles[j])-log(quantiles[2]) else quantiles[j]-quantiles[2]
+        label <- paste0(title,"\n",if(j==1L) "P05" else "P95"," = ",er_format_coef(quantiles[j]),
+                        " : Median = ",er_format_coef(quantiles[2]))
+        append_effect(term,label,ce$EST[i],ce$SE[i],delta,"continuous")
+      }
+    }
+  }
+  if(!length(rows)) return(data.frame(rowname=character(),label=character(),Eff=numeric(),Eff_LB=numeric(),
+    Eff_UB=numeric(),eff_text=character(),var_type=character(),stringsAsFactors=FALSE))
+  plot_df <- do.call(rbind,rows);attr(plot_df,"effect") <- effect;plot_df
+}
+
+forest_plot <- function(plot_df, xlab) {
+  plot_df <- as.data.frame(plot_df, stringsAsFactors = FALSE)
+  plot_df <- plot_df[is.finite(plot_df$Eff) & is.finite(plot_df$Eff_LB) &
+                     is.finite(plot_df$Eff_UB), , drop = FALSE]
+  if (!nrow(plot_df))
+    return(ggplot() + theme_void())
+  if (any(is.na(plot_df$label) | !nzchar(as.character(plot_df$label))))
+    plot_df$label <- ifelse(is.na(plot_df$label) | !nzchar(as.character(plot_df$label)),
+                            as.character(plot_df$rowname), as.character(plot_df$label))
+  plot_df$yid <- factor(seq_len(nrow(plot_df)),
+                        levels = seq_len(nrow(plot_df))[order(plot_df$var_type)])
+  rng  <- range(c(plot_df$Eff_LB, plot_df$Eff_UB, 1), na.rm = TRUE)
+  xlim <- c(max(rng[1] / 10^0.25, 1e-3), rng[2] * 10^0.25)
+  longest_line <- function(x) {
+    x <- as.character(x); x <- x[!is.na(x)]
+    if (!length(x)) return(0)
+    max(vapply(strsplit(x, "\n", fixed = TRUE),
+               function(s) max(nchar(s), 0), numeric(1)))
+  }
+  lab_pt <- longest_line(plot_df$label) * 5.7 + 14
+  eff_pt <- longest_line(plot_df$eff_text) * 5.7 + 14
+  ggplot(plot_df, aes(y = yid)) +
+    geom_segment(aes(x = Eff_LB, xend = Eff_UB, yend = yid),
+                 linewidth = 0.6, color = "grey30") +
+    geom_point(aes(x = Eff, shape = var_type, color = var_type), size = 3, stroke = 1.1) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+    geom_text(aes(x = xlim[1], label = label), hjust = 1, size = 4, lineheight = 0.95) +
+    geom_text(aes(x = xlim[2], label = eff_text), hjust = 0, size = 4) +
+    scale_x_log10(name = xlab, labels = scales::label_number()) +
+    scale_shape_manual(values = c(categorical = 1, continuous = 15), guide = "none") +
+    scale_color_manual(values = c(categorical = "black", continuous = "red"), guide = "none") +
+    labs(y = NULL) +
+    coord_cartesian(xlim = xlim, clip = "off") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid       = element_blank(),
+          panel.border     = element_blank(),
+          axis.line.x      = element_line(color = "black", linewidth = 0.6),
+          axis.ticks.x     = element_line(color = "black"),
+          axis.text.x      = element_text(size = 10),
+          axis.title.x     = element_text(size = 11, margin = margin(t = 8)),
+          axis.text.y      = element_blank(),
+          axis.ticks.y     = element_blank(),
+          plot.background  = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.margin      = margin(8, eff_pt, 8, lab_pt))
+}
+forest_height <- function(plot_df, row_in = 0.42, min_h = 4.5)
+  max(min_h, nrow(plot_df) * row_in + 1.8)
+
+con_cov_glob <- CON_COV
+cat_cov_glob <- CAT_COV
+REG_VAR <- if (DOSE_VAR %in% names(pop_eff) &&
+               length(unique(stats::na.omit(pop_eff[[DOSE_VAR]]))) > 1) DOSE_VAR else NA
+REG_LAB <- REG_LABEL
+
+# Display names and units
+var_meta_all <- function(nms) {
+  nms <- unique(as.character(nms))
+  nms <- nms[!is.na(nms) & nzchar(nms)]
+  data.frame(orig_var = nms,
+             display  = ifelse(nms %in% names(COV_LABEL),
+                               as.character(COV_LABEL[nms]), nms),
+             unit     = ifelse(nms %in% names(COV_UNIT),
+                               as.character(COV_UNIT[nms]), NA_character_),
+             stringsAsFactors = FALSE)
+}
+VAR_META <- var_meta_all(c(ALL_COV, DOSE_VAR, "DOSE", "DOSEF"))
+unit_of_label <- function(l) {
+  m <- regmatches(l, regexpr("\\(([^()]*)\\) *$", l))
+  if (length(m)) trimws(gsub("[()]", "", m)) else NA_character_
+}
+ep_var_meta <- function() {
+  rbind(as.data.frame(VAR_META, stringsAsFactors = FALSE),
+        data.frame(orig_var = c(EXPO2, PK_EXPO),
+                   display  = c(er_term_label(EXPO2), PK_EXPO),
+                   unit     = rep(unit_of_label(PK_EXPO_LAB), 2),
+                   stringsAsFactors = FALSE))
+}
+
+ep_data <- function(ep) {
+  d <- pop_eff
+  if (identical(ep$sub, "responders")) {
+    rv <- pick(names(d), c("ORR", "RESPONSE", "OR"))
+    if (!is.null(rv)) { r <- as01(d[[rv]]); d <- d[!is.na(r) & r == 1, , drop = FALSE] }
+  }
+  d
+}
+
+ep_caps <- function(ep) {
+  binary <- ep$kind=="binary"
+  model <- if(binary) "logistic regression" else "Cox regression"
+  list(method=if(binary) "Logistic" else "Cox",
+       xlab=if(binary) "Odds Ratio" else "Hazard Ratio",effect=if(binary) "OR" else "HR",
+       base=sprintf("Parameter estimates of %s %s base model",ep$label,model),
+       univ=sprintf("%s for %s %s",
+        if(isTRUE(ep$scm)) "Stepwise covariate model search" else "Univariable covariate screening",
+        ep$label,model),
+       full=sprintf("Parameter estimates of %s %s full model",ep$label,model),
+       forest=sprintf("Covariate effect plot of %s %s full model",ep$label,model),
+       median=if(binary) NULL else sprintf("Median %s and 95%% CI by exposure quartile",ep$label))
+}
+
+ep_fit <- function(ep, d = ep_data(ep)) {
+  if (ep$kind == "binary") {
+    r <- as01(d[[ep$col]]); d <- d[!is.na(r), , drop = FALSE]
+    d[[ep$col]] <- as01(d[[ep$col]])
+    out <- list(ep = ep, data = d, fitter = glm_fitter(d, ep$col),
+                se_col = "Std. Error", effect = "OR", method = "Logistic",
+                n_total = nrow(d), n_events = sum(d[[ep$col]] == 1, na.rm = TRUE))
+  } else {
+    tm <- num(d[[ep$timevar]]); ev <- as_event(d[[ep$evvar]], ep$evvar)
+    d  <- d[is.finite(tm) & !is.na(ev), , drop = FALSE]
+    d[[ep$timevar]] <- num(d[[ep$timevar]])
+    d[[ep$evvar]]   <- as_event(d[[ep$evvar]], ep$evvar)
+    out <- list(ep = ep, data = d, fitter = cox_fitter(d, ep$timevar, ep$evvar),
+                se_col = "se(coef)", effect = "HR", method = "Cox",
+                n_total = nrow(d), n_events = sum(d[[ep$evvar]] == 1, na.rm = TRUE))
+  }
+  if (!isTRUE(RUN_REGRESSION)) return(out)
+  if (nrow(out$data) < 10 || out$n_events < 3 ||
+      (ep$kind == "binary" && nrow(out$data)-out$n_events < 3)) {
+    out$regression_error <- "Insufficient evaluable patients, events or non-events"
+    return(out)
+  }
+  search <- if(isTRUE(ep$scm)) er_safety_scm else screen_model
+  out$scr <- tryCatch(search(out$data, out$fitter), error = function(e) {
+    out$regression_error <<- conditionMessage(e);message("ER_SCHEMA_SCREEN_FAIL ", ep$label, ": ", conditionMessage(e)); NULL })
+  out
+}
+
+km_median_ci <- function(fit) {
+  if(is.null(fit)) return(c(median=NA_real_, lower=NA_real_, upper=NA_real_))
+  tab <- summary(fit)$table
+  if(!is.null(dim(tab))) tab <- tab[1, ]
+  c(median=unname(tab["median"]),lower=unname(tab["0.95LCL"]),upper=unname(tab["0.95UCL"]))
+}
+median_text <- function(x) if(is.finite(x)) format(round(x,1),nsmall=1) else "NR"
+ci_time_text <- function(x) if(is.finite(x)) format(round(x,1),nsmall=1) else "NE"
+
+ep_median_table <- function(ep, d) {
+  grp <- if (HAVE_EOT) PK_EXPO_EOT else PK_EXPO
+  dq <- cut_exposure(as.data.frame(d),grp)
+  tab <- do.call(rbind,lapply(levels(dq[[grp]]),function(g) {
+    dd <- dq[dq[[grp]]==g,,drop=FALSE]
+    fit <- tryCatch(survfit(Surv(dd[[ep$timevar]],dd[[ep$evvar]])~1,
+                            conf.int=0.95,conf.type="log-log"),error=function(e) NULL)
+    ci <- km_median_ci(fit)
+    data.frame(Exposure=g,N=nrow(dd),Events=sum(dd[[ep$evvar]]==1,na.rm=TRUE),
+               Median=if(is.null(fit)) "NE" else median_text(ci["median"]),Lower=ci_time_text(ci["lower"]),
+               Upper=ci_time_text(ci["upper"]),check.names=FALSE,row.names=NULL)
+  }))
+  tab$Median <- paste0(tab$Median," (",tab$Lower,"–",tab$Upper,")")
+  tab <- tab[,c("Exposure","N","Events","Median"),drop=FALSE]
+  names(tab) <- c("Exposure quartile","N","Events",paste0("Median ",ep$label," (months, 95% CI)"))
+  tab
+}
+
+ep_univ_table <- function(ep,scr) {
+  if(isTRUE(ep$scm)) return(er_scm_table(scr$scm))
+  u <- scr$univ
+  if(is.null(u) || !nrow(u)) return(NULL)
+  rows <- list();bold_labels <- character()
+  variables <- unique(u$covariate[order(u$DELTA_BIC,na.last=TRUE)])
+  for(variable in variables) {
+    group <- u[u$covariate==variable,,drop=FALSE]
+    label <- cov_lab(variable);categorical <- variable %in% CAT_COV
+    if(categorical) {
+      rows[[length(rows)+1L]] <- data.frame(Covariate=label,Estimate="",`95% CI`="",
+        BIC=formatC(group$BIC[1],digits=1,format="f"),
+        `Delta BIC`=formatC(group$DELTA_BIC[1],digits=1,format="f"),
+        Retained=if(variable %in% scr$retained) "Yes" else "No",check.names=FALSE,stringsAsFactors=FALSE)
+      bold_labels <- c(bold_labels,label)
+    }
+    for(i in seq_len(nrow(group))) {
+      comparison <- er_comparison_label(group$Comparison[i])
+      rows[[length(rows)+1L]] <- data.frame(Covariate=if(categorical) paste0("\u00a0",comparison) else label,
+        Estimate=er_format_coef(group$EST[i]),
+        `95% CI`=paste(er_format_coef(group$CI_LB[i]),er_format_coef(group$CI_UB[i]),sep=" to "),
+        BIC=if(!categorical && i==1L) formatC(group$BIC[i],digits=1,format="f") else "",
+        `Delta BIC`=if(!categorical && i==1L) formatC(group$DELTA_BIC[i],digits=1,format="f") else "",
+        Retained=if(!categorical && i==1L) if(variable %in% scr$retained) "Yes" else "No" else "",
+        check.names=FALSE,stringsAsFactors=FALSE)
+      bold_labels <- c(bold_labels,if(categorical) "" else label)
+    }
+  }
+  tab <- do.call(rbind,rows);rownames(tab) <- NULL;attr(tab,"bold_labels") <- bold_labels;tab
+}
+
+ep_coveff <- function(ep, fit) {
+  rows <- match(rownames(model.frame(fit$scr$full)),rownames(fit$data))
+  if(anyNA(rows)) stop("Cannot align the covariate-effect display with the fitted sample")
+  coveff_table(fit$scr$full,fit$data[rows,,drop=FALSE],fit$se_col,fit$effect,var_meta=ep_var_meta())
+}
+
+ep_chunks <- function(ep,i) {
+  caps <- ep_caps(ep);k <- ep$short
+  sec <- sprintf("4.2.%d",i)
+  sec_plot <- paste0(sec,".1 Graphical analyses for ",ep$label)
+  sec_model <- paste0(sec,".2 ",caps$method," regression for ",ep$label)
+  km_pk <- if(HAVE_EOT) PK_EXPO_EOT else PK_EXPO
+  cap_rate <- paste0("Response rate of ",ep$label," by exposure quartile")
+  cap_km <- paste0("Kaplan-Meier plot of ",ep$label," by exposure quartile")
+  cap_logistic <- paste0("Logistic regression plot of ",ep$label," by exposure")
+  L <- c(paste0("### ",sec," ",ep$label),"",paste0("#### ",sec_plot),"",er_result_placeholder(ep),"")
+  if(ep$kind=="binary") { L <- c(L,
+    sprintf("```{r ep-%s-rate, fig.width=7.2, fig.height=5.2, fig.cap=%s}",k,deparse(cap_rate)),
+    sprintf("plot.rate(EP_FIT[['%s']]$data,'%s','%s',xvar=PK_EXPO,",k,ep$col,ep$label),
+    " xlab=paste0(PK_EXPO_LAB,' Quartiles'))","```","")
+  } else { L <- c(L,
+    sprintf("```{r ep-%s-km, fig.width=7.5, fig.height=6, fig.cap=%s}",k,deparse(cap_km)),
+    sprintf("km.plot(EP_FIT[['%s']]$data,pkvar='%s',timevar='%s',evvar='%s',",k,km_pk,ep$timevar,ep$evvar),
+    sprintf(" direction='%s',legend='%s',ylab='%s')",ep$direction,km_pk,
+      if(ep$direction=="up") "Cumulative event probability" else if(ep$label=="DoR") "Probability of ongoing response" else paste(ep$label,"probability")),
+    "```","")
+  }
+  if(ep$kind=="tte") L <- c(L,sprintf("```{r ep-%s-median, results='asis'}",k),
+    "if(!is.null(EP_MED)) print(kable(EP_MED,caption=CAPS$median,table.attr='class=\"table survival-median\"'))",
+    "cat('\\nNR: median not reached; NE: confidence limit not estimable.\\n')","```","")
+  c(L,ep_model_chunks(ep,sec_model,if(ep$kind=="binary") cap_logistic else NULL))
+}
+
+er_model_text <- function(ep) {
+  if(is.null(ep$scr)) return(if(length(ep$regression_error))
+    paste0("Regression could not be estimated reliably. ",ep$regression_error,"."))
+  c(if(er_full_equals_base(ep$scr)) er_same_model_text(ep$scr) else er_assessment_text(ep$scr),
+    er_result_placeholder(ep,"regression"))
+}
+
+ep_model_chunks <- function(ep,sec_model,cap_logistic=NULL) {
+  k <- ep$short
+  narrative <- er_model_text(ep)
+  if(!length(narrative)) return(character())
+  L <- c(paste0("#### ",sec_model),"",as.vector(rbind(narrative,"")))
+  if(is.null(ep$scr)) return(L)
+  L <- c(L,
+    sprintf("```{r ep-%s-base, results='asis'}",k),
+    sprintf("print(er_kable(model_out(EP_FIT[['%s']]$scr$base,EP_FIT[['%s']]$se_col,EP_FIT[['%s']]$effect),caption=CAPS$base,table.attr='class=\"table model-parameters\"'))",k,k,k),"```","")
+  if(!is.null(cap_logistic)) L <- c(L,
+    sprintf("```{r ep-%s-logi, fig.width=7.2, fig.height=6.8, fig.cap=%s}",k,deparse(cap_logistic)),
+    sprintf("plot.logi(EP_FIT[['%s']]$data,expo_par=PK_EXPO,x_lab=PK_EXPO_LAB,",k),
+    sprintf(" ev_var='%s',y_lab='%s (%%)',reg=REG_VAR,reg_lab=REG_LAB)",ep$col,ep$label),
+    "```","")
+  L <- c(L,sprintf("```{r ep-%s-univ, results='asis'}",k),
+    "if(!is.null(EP_UNIV)) print(er_kable(EP_UNIV,caption=CAPS$univ,table.attr='class=\"table covariate-screen\"'))","```","")
+  if(!er_full_equals_base(ep$scr)) L <- c(L,
+    sprintf("```{r ep-%s-full, results='asis'}",k),
+    sprintf("print(er_kable(model_out(EP_FIT[['%s']]$scr$full,EP_FIT[['%s']]$se_col,EP_FIT[['%s']]$effect),caption=CAPS$full,table.attr='class=\"table model-parameters\"'))",k,k,k),"```","")
+  if(isTRUE(ep$has_coveff)) { L <- c(L,
+    sprintf("```{r ep-%s-forest, fig.width=8.2, fig.height=EP_H, fig.cap=%s}",k,deparse(ep_caps(ep)$forest)),
+    "print(forest_plot(EP_COVEFF,CAPS$xlab))","```","")
+  } else L <- c(L,"A covariate-effect plot could not be estimated for this endpoint.","")
+  L
+}
+
+er_endpoint_report <- function(ep, fit, envir) {
+  ep$scr <- fit$scr
+  ep$regression_error <- fit$regression_error
+  reason <- fit$regression_error %||% "Regression not available"
+  cv <- NULL
+  if(!is.null(fit$scr)) {
+    reason <- "No finite estimable model contrasts"
+    cv <- tryCatch(ep_coveff(ep,fit),error=function(e) {reason <<- conditionMessage(e);NULL})
+  }
+  ep$has_coveff <- !is.null(cv) && nrow(cv)>0L
+  ce <- new.env(parent=envir)
+  ce$CAPS <- ep_caps(ep)
+  ce$EP_MED <- if(ep$kind=="tte") tryCatch(ep_median_table(ep,fit$data),error=function(e) NULL)
+  ce$EP_UNIV <- if(!is.null(fit$scr)) ep_univ_table(ep,fit$scr)
+  ce$EP_COVEFF <- cv
+  ce$EP_H <- if(ep$has_coveff) forest_height(cv) else 4.5
+  list(ep=ep,envir=ce,forest_reason=if(ep$has_coveff) "" else reason)
+}
+
+```
+
+<style>
+table th, table td {text-align: center;font-family: inherit; font-size: inherit; vertical-align: middle; word-break: normal; overflow-wrap: normal; hyphens: none;}
+table th {white-space: normal; line-height: 1.25;}
+.disposition th:first-child, .disposition td:first-child {text-align: left !important;}
+.survival-median {width: 100%;}
+.survival-median th:last-child {width: 55%; white-space: nowrap;}
+.baseline-characteristics th:first-child, .baseline-characteristics td:first-child,
+.covariate-screen th:first-child, .covariate-screen td:first-child,
+.model-parameters th:first-child, .model-parameters td:first-child {text-align: left !important; white-space: pre-line;}
+.baseline-characteristics {width: 100%; table-layout: fixed;}
+.baseline-characteristics th:first-child {width: 65%;}
+.covariate-screen th:first-child {width: 30%;}
+.covariate-screen {font-size: 0.91em;}
+.model-parameters {width:100%;table-layout:fixed;}
+.model-parameters th:first-child {width:52%;}
+.model-parameters td:first-child {white-space:nowrap;}
+.safety-endpoints {width:100%;table-layout:fixed;}
+.safety-endpoints th:first-child {width:58%;}
+.safety-endpoints th:first-child, .safety-endpoints td:first-child {text-align:left !important;white-space:nowrap;}
+
+.pmx-equation {font-weight: bold; text-align: center; margin: 0.8em 0;}
+.pmx-model-note {margin: 0 0 0.35em 1.5em;}
+</style>
+
+## Synopsis
+
+**`r DRUG` in `r INDICATION` — study `r STUDY`.**
+
+```{r synopsis}
+ep_summary_rows <- function() {
+  if (!length(EPS)) return(data.frame(Analysis = character(0), Result = character(0)))
+  do.call(rbind, lapply(EPS, function(ep) {
+    d <- ep_data(ep)
+    if (ep$kind == "binary") {
+      v <- as01(d[[ep$col]]); n1 <- sum(v == 1, na.rm = TRUE); n0 <- sum(!is.na(v))
+      val <- paste0(n1, "/", n0, " (", round(100 * n1 / max(n0, 1), 1), "%)")
+    } else {
+      ev <- as_event(d[[ep$evvar]], ep$evvar)
+      val <- paste0(sum(!is.na(ev)), " patients, ", sum(ev == 1, na.rm = TRUE), " events")
+    }
+    data.frame(Analysis = ep$label, Result = val, stringsAsFactors = FALSE)
+  }))
+}
+ep_rows <- ep_summary_rows()
+ep_med <- local({
+  endpoints <- Filter(function(ep) ep$kind=="tte",EPS)
+  if(!length(endpoints)) return(NULL)
+  do.call(rbind,lapply(endpoints,function(ep) {
+    d <- ep_data(ep)
+    fit <- tryCatch(survfit(Surv(num(d[[ep$timevar]]),as_event(d[[ep$evvar]],ep$evvar))~1,
+                            conf.int=0.95,conf.type="log-log"),error=function(e) NULL)
+    ci <- km_median_ci(fit)
+    data.frame(Analysis=paste0("Median ",ep$label," (95% CI)"),
+               Result=paste0(if(is.null(fit)) "NE" else median_text(ci["median"])," months (",ci_time_text(ci["lower"]),
+                             " to ",ci_time_text(ci["upper"]),"); NR: not reached; NE: not estimable"),
+               stringsAsFactors=FALSE)
+  }))
+})
+if(!is.null(ep_med)) ep_rows <- rbind(ep_rows,ep_med)
+
+saf_txt <- {
+  if (exists("SAFETY_DEF") && length(SAFETY_DEF))
+    paste0(length(SAFETY_DEF), " pre-specified endpoint(s): ",
+           paste(vapply(SAFETY_DEF, function(d) d$lab, character(1)),
+                 collapse = "; "))
+  else "the pre-specified safety endpoints (Section 4.3)"
+}
+tibble::tibble(
+  Analysis = c("Patients (PK / efficacy / safety)", "Exposure metric",
+               ep_rows$Analysis, "Models", "Covariate selection", "Safety endpoints"),
+  Result = c(paste0(n_pk, " / ", n_eff, " / ", n_saf),
+             paste0(PK_EXPO, " (", PK_EXPO_LAB, ")",
+                    if (HAVE_EOT) paste0("; ", PK_EXPO_EOT) else ""),
+             ep_rows$Result,
+             "Binary endpoints: logistic regression; time-to-event endpoints: Cox proportional hazards",
+             paste(c(if(RUN_EFFEC) "Efficacy: BIC-guided univariable screening",
+                     if(RUN_SAFETY && RUN_REGRESSION && length(SAFETY_MODEL_ENDPOINTS))
+                       "Designated safety endpoints: BIC-guided stepwise covariate selection"),collapse=". "),
+             saf_txt)
+) %>% kable(caption = "Synopsis of the exposure-response analyses")
+```
+
+## List of Abbreviations
+
+```{r abbreviations}
+tibble::tibble(
+  Abbreviation = c("AUC", "BIC", "Cavg", "Cavg,ss", "CI", "DoR", "E-R", "ECOG", "HR",
+                   "MRD", "OR", "ORR", "OS", "PFS", "PK", "SAE", "TEAE", "TRAE", "uMRD"),
+  Definition = c("Area under the concentration-time curve", "Bayesian information criterion",
+                 "Average concentration", "Average concentration at steady state",
+                 "Confidence interval", "Duration of response", "Exposure-response",
+                 "Eastern Cooperative Oncology Group performance status", "Hazard ratio",
+                 "Measurable residual disease", "Odds ratio", "Objective response rate", "Overall survival",
+                 "Progression-free survival", "Pharmacokinetic(s)", "Serious adverse event",
+                 "Treatment-emergent adverse event", "Treatment-related adverse event",
+                 "Undetectable measurable residual disease")
+) %>% kable(caption = "List of abbreviations")
+```
+
+# 1. Introduction
+
+```{r introduction, echo=FALSE}
+cat(paste0(
+  "This report describes associations between ", PK_EXPO_LAB,
+  " and the efficacy and safety endpoints available in the analysis dataset for ",
+  DRUG, " in ", INDICATION, ", including ", STUDY,
+  ". The fitted associations do not by themselves establish causality or a dosing recommendation."))
+```
+
+# 2. Objectives
+
+```{r objectives, echo=FALSE}
+cat(paste0(
+  "The objectives of the E-R analyses were to:\n\n",
+  "* Evaluate the exposure-efficacy relationship between ", DRUG,
+  " exposure measure and the ",
+  "evaluable efficacy endpoints.\n",
+  "* Evaluate the exposure-safety relationship between ", DRUG,
+  " exposure measure and the safety endpoints listed in Section 4.3.\n",
+  "* Evaluate the impact of clinically relevant covariates on the E-R relationships, ",
+  "to describe adjusted endpoint associations and their uncertainty."))
+```
+
+# 3. Methods
+
+## 3.1 Studies Included in the Analysis
+
+```{r table-1-studies}
+response_col <- if(length(EPS) && EPS[[1]]$kind=="binary") EPS[[1]]$col else "ORR"
+study_tab <- pop_saf %>%
+  group_by(Study = STUDYID, Treatment = TRT) %>%
+  summarise(`Patients treated` = dplyr::n(),
+            `PK evaluable` = sum(PKFL == 1),
+            `Efficacy evaluable` = sum(EFFFL == 1),
+            `Patients with response` = if (length(EPS) && EPS[[1]]$kind == "binary")
+              sum(as01(.data[[response_col]]) == 1 & EFFFL == 1, na.rm = TRUE) else NA_integer_,
+            .groups = "drop") %>%
+  arrange(Study)
+study_all <- data.frame(Study = "Total", Treatment = "",
+                        `Patients treated` = sum(study_tab$`Patients treated`),
+                        `PK evaluable` = sum(study_tab$`PK evaluable`),
+                        `Efficacy evaluable` = sum(study_tab$`Efficacy evaluable`),
+                        `Patients with response` = sum(study_tab$`Patients with response`),
+                        check.names = FALSE)
+kable(rbind(study_tab, study_all),
+      caption = "Summary of patients included in exposure-response analyses")
+```
+
+```{r table-disposition}
+disp <- data.frame(
+  Disposition = c("Patients enrolled", "PK evaluable", "Not PK evaluable",
+                  "Efficacy evaluable", "Safety evaluable"),
+  n = c(n_all, sum(er_all$PKFL == 1), sum(er_all$PKFL == 0),
+        sum(er_all$EFFFL == 1), sum(er_all$SAFEFL == 1)),
+  check.names = FALSE)
+disp$`%` <- round(100 * disp$n / n_all, 1)
+reasons <- er_all %>% filter(!is.na(EXCLREAS), EXCLREAS != "") %>%
+  count(EXCLREAS, name = "n") %>%
+  transmute(Disposition = EXCLREAS, n = n, `%` = round(100 * n / n_all, 1))
+kable(rbind(disp, as.data.frame(reasons)),table.attr='class="table disposition"', caption = "Patient disposition and analysis populations")
+```
+
+## 3.1.1 Efficacy Analysis Population
+
+```{r population-eff, echo=FALSE}
+cat(paste0("The exposure-efficacy population includes patients with ",
+           INDICATION, " from ", STUDY, " who received ", DRUG,
+           " and had both an evaluable steady-state PK metric and at least one ",
+           "post-baseline response assessment (", paste(sort(unique(pop_eff$TRT)), collapse = "; "),
+           ")."))
+```
+
+## 3.1.2 Safety Analysis Population
+
+```{r population-saf, echo=FALSE}
+cat(paste0("The exposure-safety population includes patients with ",
+           INDICATION, " who received at least one dose of ", DRUG,
+           " and had at least one evaluable steady-state PK metric. Safety endpoints ",
+           "were assessed over the whole treatment period."))
+```
+
+## 3.2 Exposure Measures
+
+```{r exposure-measures, echo=FALSE}
+cat(paste0(
+  "Exposure measures are read from the supplied analysis file. The primary measure is ",
+  PK_EXPO_LAB, " (", PK_EXPO, "); average concentration to end of treatment (", PK_EXPO_EOT,
+  ") is used in the time-to-event graphical summaries when available. Regression models use ",
+  if (LOGPK) "natural-log " else "raw ", PK_EXPO, ". The upstream method used to derive exposure is not inferred from the column name."))
+```
+
+## 3.3 Data Assembly
+
+```{r data-assembly, echo=FALSE}
+cat(paste0(
+  "The supplied patient-level analysis file, ", basename(DATA_FILE),
+  ", contains exposure measures, efficacy outcomes, safety outcomes and covariates. ",
+  "Analysis populations use the available PKFL, EFFFL and SAFEFL flags. No dataset merge is performed by this report."))
+```
+
+## 3.4 Data Handling
+
+```{r data-handling, echo=FALSE}
+cat(paste0(
+  "Each model uses complete cases for its endpoint, exposure and included covariates; missing values are not imputed. ",
+  "Model sample sizes can therefore differ. Each univariable candidate is compared with an exposure-only model fitted on the same rows. ",
+  "Continuous covariates enter on the configured scale; P05/P95 versus median are contrasts for reporting covariate effects, not median centring of fitted predictors."))
+```
+
+## 3.5 Exposure-Response Analysis and Modelling Methods
+
+```{r methods-text, echo=FALSE, results='asis'}
+for(text in c(er_method_text(),er_safety_method())) {
+  equation <- grepl("^\\s*(logit\\s*\\(|h\\s*\\(t\\))[^:]*=",text,perl=TRUE)
+  note <- grepl("^\\s*(P_?i|β[012]|COV_?i|h0?\\(t\\))\\s*:",text,perl=TRUE)
+  cls <- if(equation) ' class="pmx-equation"' else if(note) ' class="pmx-model-note"' else ''
+  cat("<p",cls,">",htmltools::htmlEscape(text),"</p>\n",sep="")
+}
+```
+
+### 3.5.1 Covariate Analysis
+
+```{r covariate-method-text, echo=FALSE, results='asis'}
+cat(er_covariate_method(),sep="\n\n")
+```
+
+```{r prepare-demography, include=FALSE}
+support_paths <- c(file.path(Sys.getenv("PMX_WORD_REPORT",""),"ppk_report_support.R"),
+  file.path(".pmx","word-report","ppk_report_support.R"),
+  file.path(".pmx","pmx_workspace","word-report","ppk_report_support.R"),
+  file.path(Sys.getenv("PMX_TOOLKIT",""),"word-report","ppk_report_support.R"),
+  file.path("word-report","ppk_report_support.R"))
+support_paths <- support_paths[file.exists(support_paths)]
+if(!length(support_paths)) stop("Report support missing: use the complete workspace toolkit")
+source(support_paths[1])
+cov_lab <- function(v) {
+  lab <- if(v %in% names(COV_LABEL)) COV_LABEL[[v]] else v
+  unit <- if(v %in% names(COV_UNIT)) COV_UNIT[[v]] else ""
+  paste0(lab,if(!is.na(unit)&&nzchar(unit)) paste0(" (",unit,")") else "")
+}
+demog_labels <- setNames(vapply(unique(c(CON_COV,CAT_COV,DOSE_VAR)),cov_lab,""),unique(c(CON_COV,CAT_COV,DOSE_VAR)))
+albumin_summary <- function(x,unit,lln=NULL) {
+  known_units <- c("g/l"=35,"g/dl"=3.5)
+  if(length(unit)!=1L || is.na(unit) || !tolower(trimws(unit)) %in% names(known_units))
+    return(NULL)
+  if(is.null(lln)) lln <- known_units[[tolower(trimws(unit))]]
+  if(!is.numeric(lln) || length(lln)!=1L || !is.finite(lln) || lln<=0)
+    stop("ALBUMIN_LLN must be a positive value in the declared albumin units")
+  values <- num(x)
+  valid <- is.finite(values)
+  if(!any(valid)) return(NULL)
+  n <- sum(valid & values<lln)
+  sprintf("Baseline albumin below %s %s was observed in %d of %d efficacy patients with nonmissing values (%.1f%%).",
+    format(lln,trim=TRUE),unit,n,sum(valid),100*n/sum(valid))
+}
+albumin_note <- albumin_summary(pop_eff$ALB,unname(COV_UNIT["ALB"]),ALBUMIN_LLN)
+demog <- pmx_patient_characteristics(pop_eff,CON_COV,unique(c(CAT_COV,DOSE_VAR)),demog_labels,
+  level_display=cat_level_display,id="SUBJID")
+
+```
+
+### 3.5.2 Software
+
+```{r software, echo=FALSE}
+cat(paste0("Exposure-response analyses were conducted using R version ",
+           R.version$major, ".", R.version$minor,
+           " (glm for logistic regression, survival::coxph for the Cox proportional ",
+           "hazards models, survminer::ggsurvplot for the Kaplan-Meier plots)."))
+```
+
+```{r exposure-summary}
+expo_sum <- pop_saf %>%
+  group_by(`Dose/regimen` = as.character(.data[[DOSE_VAR]])) %>%
+  summarise(N = dplyr::n(),
+            `Cavg,ss: median [min, max]`  = medrng(.data[[PK_EXPO]]),
+            `Cavg,EOT: median [min, max]` = medrng(.data[[PK_EXPO_EOT]]),
+            .groups = "drop")
+kable(as.data.frame(expo_sum), caption = "Summary of exposure metrics by dose")
+```
+
+# 4. Results
+
+## 4.1 Patient Population
+
+```{r results-population, echo=FALSE}
+cat("Patient characteristics are summarized in the baseline characteristics table; analysis populations are detailed in the disposition table.")
+```
+
+```{r patient-covariate-summary, results='asis', echo=FALSE}
+cat(er_kable(demog, caption = paste0("Patient demographics, disease characteristics and laboratory values at baseline",if(isTRUE(attr(demog,"stratified_by_study"))) " by study" else "", " (efficacy population)"),
+      align=paste0("l",strrep("c",ncol(demog)-1)),table.attr='class="table baseline-characteristics"'),
+    '\n<p class="table-footnote">Continuous variables are presented as median [min, max], while categorical variables are presented as n (%) of patients with nonmissing values. Missing values are reported separately.</p>\n')
+```
+
+```{r albumin-summary, results='asis', echo=FALSE}
+if(length(albumin_note)) cat(albumin_note,"\n\n")
+```
+
+### 4.1.1 Patient Population For Exposure-Efficacy Analysis
+
+```{r pop-efficacy-results, echo=FALSE}
+cat("Endpoint-specific efficacy populations are defined by evaluable exposure and endpoint records.")
+```
+
+### 4.1.2 Patient Population for Exposure-Safety Analysis
+
+```{r pop-safety-results, echo=FALSE}
+cat("Endpoint-specific safety populations are defined by evaluable exposure and event records.")
+```
+
+## 4.2 Exposure Efficacy Analysis
+
+```{r efficacy-intro, echo=FALSE}
+ep_labs <- vapply(EPS, function(e) e$label, character(1))
+ep_kind <- vapply(EPS, function(e) if (e$kind == "binary") "binary" else "time-to-event",
+                  character(1))
+if(!RUN_EFFEC) {
+  cat("No exposure-efficacy analysis was performed.")
+} else cat(paste0("Exposure-efficacy analyses were performed for ",
+           paste(sprintf("%s (%s)", ep_labs, ep_kind), collapse = ", "),
+           " in the efficacy population, against ",
+           PK_EXPO, if(LOGPK) " (log-transformed). " else " (untransformed). ", "Each endpoint is analysed the same way: ",
+           "the observed event rate by exposure quartile, the individual ",
+           "exposure-response plot, and then the exposure-only model, the ",
+           "univariable covariate screening and the full model holding the ",
+           "retained covariates.\n"))
+```
+
+```{r efficacy-loop, eval=RUN_EFFEC, results="asis", echo=FALSE}
+for (i in seq_along(EPS)) {
+  ep  <- EPS[[i]]
+  key <- ep$short
+  fit <- tryCatch(ep_fit(ep), error = function(e) {
+    message("ER_SCHEMA_MODEL_FAIL ", ep$label, ": ", conditionMessage(e)); NULL })
+  if (is.null(fit)) {
+    cat("\n### ", sprintf("4.2.%d", i), " ", ep$label, "\n\n",
+        "The analysis for this endpoint failed in this dataset and is not reported.\n\n",
+        sep = "")
+    next
+  }
+  EP_FIT[[key]] <- fit
+  report <- er_endpoint_report(ep,fit,environment())
+  EP_COVEFF_OK[[key]] <- report$ep$has_coveff
+  EP_FOREST_REASON[[key]] <- report$forest_reason
+  cat(knitr::knit_child(text=ep_chunks(report$ep,i),quiet=TRUE,envir=report$envir),sep="\n")
+}
+```
+
+```{r endpoints-manifest, eval=RUN_EFFEC, include=FALSE}
+ep_row <- function(i) {
+  ep  <- EPS[[i]]; fit <- EP_FIT[[ep$short]]
+  caps <- ep_caps(ep)
+  sec  <- sprintf("4.2.%d", i)
+  eff_txt <- NA_character_; cov_ret <- character(0)
+  if (!is.null(fit) && !is.null(fit$scr)) {
+    b <- coef(fit$scr$base); hit <- match(EXPO2,names(b))
+    if(!is.na(hit)) {
+      se <- summary(fit$scr$base)$coefficients[hit,fit$se_col]
+      limits <- exp(b[hit]+c(-1,1)*qnorm(.975)*se)
+      eff_txt <- paste0(er_format_coef(exp(b[hit]))," (",
+        er_format_coef(limits[1])," - ",er_format_coef(limits[2]),")")
+    }
+    cov_ret <- fit$scr$retained
+  }
+  data.frame(endpoint = ep$short, label = ep$label, kind = ep$kind,
+             method = caps$method, effect = caps$effect,
+             section = sec, sec_plot = paste0(sec, ".1 Graphical analyses for ", ep$label),
+             sec_model = if (is.null(fit) || is.null(fit$scr)) NA_character_ else
+                         paste0(sec, ".2 ", caps$method, " regression for ", ep$label),
+             has_model = !is.null(fit) && !is.null(fit$scr),
+             has_forest = isTRUE(EP_COVEFF_OK[[ep$short]]),
+             n_total = if (is.null(fit)) NA_integer_ else fit$n_total,
+             n_events = if (is.null(fit)) NA_integer_ else fit$n_events,
+             effect_text = eff_txt,
+             retained = paste(cov_ret, collapse = "; "),
+             cap_base = caps$base, cap_univ = caps$univ, cap_full = caps$full,
+             cap_median = caps$median %||% NA_character_,
+             stringsAsFactors = FALSE)
+}
+if (length(EPS)) {
+  EP_MAN <- do.call(rbind, lapply(seq_along(EPS), ep_row))
+  write.csv(EP_MAN, file.path(OUT_DIR, "endpoints.csv"), row.names = FALSE)
+  cat("ER_ENDPOINTS_WRITTEN", nrow(EP_MAN), "endpoints\n")
+}
+```
+
+## 4.3 Exposure Safety Analysis
+
+```{r safety-setup}
+SAFETY_DEF <- Filter(function(d) {
+  !is.null(d$var) && d$var %in% names(pop_saf) &&
+    any(!is.na(as01(pop_saf[[d$var]])))
+}, SAFETY_DEF)
+if (!length(SAFETY_DEF)) RUN_SAFETY <- FALSE
+SAFETY_DEF <- lapply(seq_along(SAFETY_DEF), function(i) {
+  d <- SAFETY_DEF[[i]]
+  d$sec <- paste0("4.3.", i)
+  d$ep <- list(kind="binary",col=d$var,label=d$lab,
+    short=paste0("safety_",tolower(d$var)),scm=TRUE)
+  d$model <- isTRUE(RUN_REGRESSION) && toupper(d$var) %in% SAFETY_MODEL_ENDPOINTS
+  d$cap_rate <- paste0("Event rate of ",d$lab," by exposure quantile")
+  d$cap_logi <- paste0("Unadjusted logistic regression for ",d$lab," by exposure")
+  d$cap_tte <- paste0("Cumulative event probability for ",d$lab," by exposure quantile")
+  d$sec_model <- if(d$model) paste0(d$sec,".1 Logistic regression for ",d$lab) else NA_character_
+  raw_event <- as01(pop_saf[[d$var]])
+  d$n_events <- sum(raw_event == 1, na.rm = TRUE)
+  d$n_total <- sum(!is.na(raw_event))
+  d
+})
+message("ER_SCHEMA_SAFETY endpoints: ", length(SAFETY_DEF))
+
+SAFETY_DATA <- SAFETY_EVIDENCE <- SAFETY_TTE_DATA <- SAFETY_MODEL_TEXT <- list()
+if(isTRUE(RUN_SAFETY)) for(d in SAFETY_DEF) {
+  event <- as01(pop_saf[[d$var]]); exposure <- num(pop_saf[[PK_EXPO]])
+  keep <- !is.na(event) & is.finite(exposure) & (!LOGPK | exposure > 0)
+  dat <- pop_saf[keep,,drop=FALSE]
+  dat[[d$var]] <- event[keep]; dat[[PK_EXPO]] <- exposure[keep]
+  grouped <- tryCatch(cut_exposure(dat,PK_EXPO),error=function(e) NULL)
+  quartiles <- if(is.null(grouped)) data.frame() else do.call(rbind,lapply(levels(grouped[[PK_EXPO]]),function(g) {
+    hit <- !is.na(grouped[[PK_EXPO]]) & grouped[[PK_EXPO]]==g
+    y <- dat[[d$var]][hit]; ci <- if(length(y)) binom.test(sum(y),length(y))$conf.int else c(NA_real_,NA_real_)
+    data.frame(group=g,n=length(y),events=sum(y),exposure_median=median(dat[[PK_EXPO]][hit]),
+      event_rate=if(length(y)) mean(y) else NA_real_,lower=ci[1],upper=ci[2],row.names=NULL)
+  }))
+  SAFETY_DATA[[d$var]] <- dat
+  SAFETY_EVIDENCE[[d$var]] <- list(endpoint=d$var,label=d$lab,section=paste(d$sec,d$lab),
+    exposure=PK_EXPO,exposure_label=PK_EXPO_LAB,exposure_scale=if(LOGPK) "log" else "raw",
+    n_evaluable=nrow(dat),events=sum(dat[[d$var]]),non_events=sum(dat[[d$var]]==0),
+    excluded_missing_exposure_or_endpoint=sum(!keep),quartiles=quartiles,
+    confidence=.95,rate_scale="proportion",rate_interval_method="exact binomial",
+    bar_error_bars="upper arm of one standard error",trend_review="pending",
+    curve_role="unadjusted logistic display",adjusted_model=FALSE,
+    model_key=if(d$model) d$ep$short else NULL,
+    model_state=if(d$model) "pending" else "not_requested",
+    plots_available=!is.null(grouped) && sum(dat[[d$var]])>=3)
+  if (isTRUE(RUN_SAFETY_TTE) && !is.null(d$time) && d$time %in% names(pop_saf)) {
+    tm <- num(pop_saf[[d$time]])
+    km_exposure <- if(HAVE_EOT) PK_EXPO_EOT else PK_EXPO
+    valid <- is.finite(tm) & !is.na(event) & is.finite(num(pop_saf[[km_exposure]]))
+    dd <- pop_saf[valid,,drop=FALSE]
+    dd[[d$time]] <- tm[valid]
+    dd[[d$var]] <- event[valid]
+    if(nrow(dd)>=3 && any(dd[[d$var]]==1) &&
+       !is.null(tryCatch(cut_exposure(dd,km_exposure),error=function(e) NULL)))
+      SAFETY_TTE_DATA[[d$var]] <- dd
+  }
+}
+safety_placeholder <- function(label) paste0("[Exposure-safety trend for ",label,": interpretation pending.]")
+
+saf_events <- do.call(rbind, lapply(SAFETY_DEF, function(d) {
+  data.frame(Endpoint = d$lab,
+             N = d$n_total,
+             Events = d$n_events,
+             `Patients (%)` = round(100 * d$n_events / d$n_total, 1),
+             check.names = FALSE)
+}))
+if (!is.null(saf_events) && nrow(saf_events)) {
+  kable(saf_events, format="html",caption="Summary of exposure-safety endpoints (safety population)",
+    align="lccc",table.attr='class="table safety-endpoints"')
+} else {
+  cat("No evaluable pre-specified safety endpoints were supplied.\n")
+}
+```
+
+```{r safety-figures, eval=RUN_SAFETY, results="asis"}
+for (d in SAFETY_DEF) {
+  cat("\n\n### ", d$sec, " ", d$lab, "\n\n", sep="")
+  cat(safety_placeholder(d$lab),"\n\n")
+  dat <- SAFETY_DATA[[d$var]]
+  ep <- d$ep
+  body <- character()
+  ce <- new.env(parent=environment())
+  ce$SAF_D <- d
+  ce$SAF_DAT <- dat
+  fit <- if(d$model) ep_fit(ep,dat)
+  ce$SAF_BASE <- fit$scr$base
+  if (isTRUE(SAFETY_EVIDENCE[[d$var]]$plots_available)) {
+    ce$SAF_REG <- if(DOSE_VAR %in% names(dat) && any(!is.na(dat[[DOSE_VAR]]))) DOSE_VAR else NA
+    body <- c(body,
+      sprintf("```{r %s-rate, fig.width=7.2, fig.height=5.2, fig.cap=SAF_D$cap_rate}",ep$short),
+      "plot.rate(SAF_DAT,SAF_D$var,SAF_D$lab)","```","",
+      sprintf("```{r %s-logi, fig.width=7.2, fig.height=6, fig.cap=SAF_D$cap_logi}",ep$short),
+      "print(plot.logi(SAF_DAT,ev_var=SAF_D$var,y_lab=paste0(SAF_D$lab,' (%)'),reg=SAF_REG,reg_lab=REG_LABEL,curve=SAF_BASE))",
+      "```","")
+  } else body <- c(body,"Insufficient evaluable events or exposure groups for exposure-response plots.","")
+  dd <- SAFETY_TTE_DATA[[d$var]]
+  if(!is.null(dd)) {
+    ce$SAF_TTE <- dd
+    body <- c(body,
+      sprintf("```{r %s-km, fig.width=7.5, fig.height=6, fig.cap=SAF_D$cap_tte}",ep$short),
+      "km.plot(SAF_TTE,pkvar=if(HAVE_EOT) PK_EXPO_EOT else PK_EXPO,timevar=SAF_D$time,",
+      "        evvar=SAF_D$var,direction='up',legend=PK_EXPO_LAB)",
+      "```","")
+  }
+  cat(knitr::knit_child(text=body,quiet=TRUE,envir=ce),sep="\n")
+  if(d$model) {
+    EP_FIT[[ep$short]] <- fit
+    report <- er_endpoint_report(ep,fit,environment())
+    EP_COVEFF_OK[[ep$short]] <- report$ep$has_coveff
+    EP_FOREST_REASON[[ep$short]] <- report$forest_reason
+    evidence <- SAFETY_EVIDENCE[[d$var]]
+    evidence$model_state <- if(is.null(fit$scr)) "not_estimable" else "available"
+    evidence$model_reason <- fit$regression_error
+    evidence$adjusted_model <- length(fit$scr$retained)>0L
+    SAFETY_EVIDENCE[[d$var]] <- evidence
+    SAFETY_MODEL_TEXT[[d$sec_model]] <- er_model_text(report$ep)
+    cat(knitr::knit_child(text=ep_model_chunks(report$ep,d$sec_model),quiet=TRUE,envir=report$envir),sep="\n")
+  }
+}
+```
+
+```{r safety-manifest, eval=RUN_SAFETY, include=FALSE}
+if (length(SAFETY_DEF)) {
+  SAF_MAN <- do.call(rbind, lapply(SAFETY_DEF, function(d) {
+    has_tte <- !is.null(SAFETY_TTE_DATA[[d$var]])
+    data.frame(endpoint = d$var, label = d$lab,
+               section = d$sec, sec_full = paste0(d$sec, " ", d$lab),
+               n_total = d$n_total, n_events = d$n_events,
+               sec_model = d$sec_model, has_model = !is.null(EP_FIT[[d$ep$short]]$scr),
+               has_forest = isTRUE(EP_COVEFF_OK[[d$ep$short]]),
+               n_figures = 2L*isTRUE(SAFETY_EVIDENCE[[d$var]]$plots_available) +
+                 as.integer(has_tte) + as.integer(isTRUE(EP_COVEFF_OK[[d$ep$short]])),
+               has_tte = has_tte, cap_rate = d$cap_rate, cap_logi = d$cap_logi, cap_tte = d$cap_tte,
+               stringsAsFactors = FALSE)
+  }))
+  write.csv(SAF_MAN, file.path(OUT_DIR, "safety_endpoints.csv"), row.names = FALSE)
+  cat("ER_SAFETY_WRITTEN", nrow(SAF_MAN), "endpoints\n")
+}
+```
+
+# 5. Discussion
+
+```{r discussion, echo=FALSE}
+cat("[Discussion: interpret supported exposure-efficacy and exposure-safety trends, covariate effects and limitations, with references to the relevant figures and tables.]\n")
+```
+
+# 6. Conclusions
+
+```{r conclusions, echo=FALSE}
+cat("[Conclusion: state the supported takeaway and material limitations; cite the relevant figures or tables and include numbers only when their meaning needs discussion.]\n")
+```
+
+```{r references, echo=FALSE, results='asis'}
+if(length(REPORT_REFERENCES)) {
+  cat("# 7. References\n\n")
+  cat(paste(REPORT_REFERENCES,collapse="\n\n"),"\n\n")
+}
+```
+
+<style>h1#appendix {text-align: center; break-before: page; page-break-before: always;}</style>
+
+# APPENDIX
+
+## Appendix 1: Patient disposition and analysis populations
+
+```{r appendix-1}
+kable(rbind(disp, as.data.frame(reasons)),table.attr='class="table disposition"',
+      caption = "Patient disposition and analysis populations")
+```
+
+```{r save-outputs, eval=SAVE_OUTPUTS, include=FALSE}
+dir.create(ANALYSIS_TABLE_DIR, showWarnings = FALSE, recursive = TRUE)
+write.csv(demog,           file.path(ANALYSIS_TABLE_DIR, "tbl_demography.csv"),      row.names = FALSE)
+write.csv(saf_events,      file.path(ANALYSIS_TABLE_DIR, "tbl_safety_events.csv"),   row.names = FALSE)
+write.csv(study_tab,       file.path(ANALYSIS_TABLE_DIR, "tbl_studies.csv"),         row.names = FALSE)
+write.csv(as.data.frame(expo_sum), file.path(ANALYSIS_TABLE_DIR, "tbl_exposure.csv"), row.names = FALSE)
+if (length(EP_FIT)) {
+  for (k in names(EP_FIT)) {
+    f <- EP_FIT[[k]]
+    if (is.null(f) || is.null(f$scr)) next
+    write.csv(model_out(f$scr$base, f$se_col, f$effect),
+              file.path(ANALYSIS_TABLE_DIR, paste0("tbl_", k, "_base.csv")), row.names = FALSE)
+    if(!er_full_equals_base(f$scr)) write.csv(model_out(f$scr$full, f$se_col, f$effect),
+              file.path(ANALYSIS_TABLE_DIR, paste0("tbl_", k, "_full.csv")), row.names = FALSE)
+    un <- tryCatch(ep_univ_table(f$ep, f$scr), error = function(e) NULL)
+    if (!is.null(un)) write.csv(un, file.path(ANALYSIS_TABLE_DIR, paste0("tbl_", k, "_univ.csv")),
+                                row.names = FALSE)
+    cv <- tryCatch(ep_coveff(f$ep, f), error = function(e) NULL)
+    if (!is.null(cv) && nrow(cv))
+      write.csv(cv, file.path(ANALYSIS_TABLE_DIR, paste0("tbl_", k, "_coveff.csv")), row.names = FALSE)
+    if (f$ep$kind == "tte") {
+      mt <- tryCatch(ep_median_table(f$ep, f$data), error = function(e) NULL)
+      if (!is.null(mt)) write.csv(mt, file.path(ANALYSIS_TABLE_DIR, paste0("tbl_", k, "_median.csv")),
+                                  row.names = FALSE)
+    }
+  }
+}
+cat("wrote", length(list.files(ANALYSIS_TABLE_DIR)), "analysis tables to", ANALYSIS_TABLE_DIR, "\n")
+```
+
+
+```{r report-result-contract, include=FALSE}
+dir.create(OUT_DIR,showWarnings=FALSE)
+models <- list()
+for(k in names(EP_FIT)) {
+  x <- EP_FIT[[k]]; if(is.null(x$scr)) next
+  fit <- x$scr$full; co <- summary(fit)$coefficients
+  parameter_table <- model_out(fit,x$se_col,x$effect)
+  models[[k]] <- list(endpoint=x$ep$label,kind=x$effect,exposure=EXPO2,
+    term_labels=er_model_term_labels(fit),
+    parameter_table=parameter_table,
+    parameter_bold_labels=attr(parameter_table,"bold_labels"),
+    estimates=data.frame(term=rownames(co),estimate=as.numeric(co[,1]),se=as.numeric(co[,x$se_col]),
+      p_value=2*pnorm(-abs(co[,1]/co[,x$se_col])),stringsAsFactors=FALSE),
+    assessment=x$scr$assessment,failed_covariates=x$scr$failed,
+    selection_method=if(isTRUE(x$ep$scm)) "Stepwise BIC" else "Univariable screening",
+    scm=x$scr$scm,
+    full_equals_base=er_full_equals_base(x$scr),
+    screening_evaluable=if(isTRUE(x$ep$scm)) sum(is.finite(x$scr$scm$Delta_BIC)) else nrow(x$scr$univ %||% data.frame()),
+    forest=list(state=if(isTRUE(EP_COVEFF_OK[[k]])) "available" else "not_estimable",reason=EP_FOREST_REASON[[k]]),
+    n=nrow(model.frame(fit)),base_n=nrow(model.frame(x$scr$base)),retained=unique(x$scr$retained),formula=paste(deparse(formula(fit)),collapse=" "),
+    base_formula=paste(deparse(formula(x$scr$base)),collapse=" "),
+    base_estimates=data.frame(term=names(coef(x$scr$base)),estimate=as.numeric(coef(x$scr$base)),
+      se=as.numeric(summary(x$scr$base)$coefficients[,x$se_col]),stringsAsFactors=FALSE),
+    n_endpoint=x$n_total,n_events=x$n_events,event_definition=if(x$ep$kind=="binary") x$ep$col else x$ep$evvar,
+    categorical_contrasts=lapply(Filter(is.factor,model.frame(fit)),function(v) list(reference=levels(v)[1],levels=levels(v))),
+    uncertainty=list(coefficient_scale=if(x$effect=="OR") "log odds" else "log hazard",rse="100 * SE / abs(coefficient)",confidence=.95))
+}
+report_sections <- list(
+  Introduction=paste0("This report describes associations between ",PK_EXPO_LAB," and the efficacy and safety endpoints in the supplied analysis dataset. Fitted associations do not by themselves establish causality or a dosing recommendation."),
+  Objectives="Evaluate exposure associations with efficacy and designated safety endpoints and assess covariates using the specified screening procedures.",
+  DataAssembly=paste0("The patient-level file ",basename(DATA_FILE)," supplies exposure, endpoints and covariates. Analysis populations use the available PKFL, EFFFL and SAFEFL flags; the report performs no dataset merge."),
+  DataHandling="Models use complete cases for their required variables without imputation. Each covariate comparison uses the same rows for the candidate and reference models. P05/P95 versus median are the reported contrasts for continuous covariates.",
+  ExposureMeasures=paste0("The primary exposure measure is ",PK_EXPO_LAB,". Regression uses ",if(LOGPK) "natural-log" else "raw"," exposure. The model formula identifies the exposure term actually fitted for each endpoint."),
+  Methods=c(er_method_text(),er_safety_method()),
+  CovariateAnalysis=er_covariate_method(),
+  Software=paste0("Exposure-response analyses were conducted using R version ",getRversion(),"."),
+  References=REPORT_REFERENCES)
+section_results <- list(
+  "4.1 Patient Population"=c("Patient characteristics are summarized in the baseline characteristics table; analysis populations are detailed in the disposition table.",albumin_note),
+  "4.1.1 Patient Population For Exposure-Efficacy Analysis"="Endpoint-specific efficacy populations use evaluable exposure and endpoint records.",
+  "4.1.2 Patient Population for Exposure-Safety Analysis"="Endpoint-specific safety populations use evaluable exposure and event records.")
+for(i in seq_along(EPS)) {
+  ep <- EPS[[i]]; x <- EP_FIT[[ep$short]]
+  if(is.null(x)) next
+  caps <- ep_caps(ep);sec <- paste0("4.2.",i)
+  section_results[[paste(sec,ep$label)]] <- character()
+  plot_section <- paste0(sec,".1 Graphical analyses for ",ep$label)
+  section_results[[plot_section]] <- er_result_placeholder(ep)
+  ep$scr <- x$scr
+  ep$regression_error <- x$regression_error
+  section_results[[paste0(sec,".2 ",caps$method," regression for ",ep$label)]] <- er_model_text(ep)
+}
+if(isTRUE(RUN_SAFETY) && exists("SAFETY_DEF")) for(d in SAFETY_DEF) {
+  section_results[[paste(d$sec,d$lab)]] <- safety_placeholder(d$lab)
+}
+section_results <- c(section_results,SAFETY_MODEL_TEXT)
+saveRDS(list(schema=1L,family="er",data_md5=unname(tools::md5sum(DATA_FILE)),
+  models=models,exposure_label=PK_EXPO_LAB,scale=if(LOGPK) "log" else "raw",
+  report_sections=report_sections,section_results=section_results,safety=SAFETY_EVIDENCE,
+  covariates=list(derivations=lapply(COV_DERIVE,function(f) paste(deparse(f),collapse=" ")),continuous=CON_COV,categorical=CAT_COV,labels=COV_LABEL,units=COV_UNIT,levels=COV_LEVELS)),
+  file.path(OUT_DIR,"report_results.rds"))
+```

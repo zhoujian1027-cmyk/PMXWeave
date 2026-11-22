@@ -1,0 +1,96 @@
+$PROBLEM Simeoni TGI 1-cpt IV | SAEM
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(CENTRAL) COMP=(W1) COMP=(W2) COMP=(W3) COMP=(W4)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVVC = THETA(2)
+TVW0 = THETA(3)
+TVLAM0 = THETA(4)
+TVLAM1 = THETA(5)
+TVK2 = THETA(6)
+TVK1 = THETA(7)
+
+; MU references
+MU_1 = LOG(TVCL)
+MU_2 = LOG(TVVC)
+MU_3 = LOG(TVW0)
+MU_4 = LOG(TVLAM0)
+MU_5 = LOG(TVLAM1)
+MU_6 = LOG(TVK2)
+
+; PK parameters
+CL = EXP(MU_1 + ETA(1))
+VC = EXP(MU_2 + ETA(2))
+
+; Tumor growth/kill parameters
+PSI = 20    ; PSI
+W0 = EXP(MU_3 + ETA(3))
+LAM0 = EXP(MU_4 + ETA(4))
+LAM1 = EXP(MU_5 + ETA(5))
+K2 = EXP(MU_6 + ETA(6))
+K1 = TVK1
+A_0(2) = W0
+
+$DES
+K10 = CL/VC
+DADT(1) = -K10*A(1)
+W = A(2) + A(3) + A(4) + A(5)    ; total tumor size
+C2 = A(1)/VC    ; drug concentration
+GROWTH = LAM0*A(2)/(1+(LAM0/LAM1*W)**PSI)**(1/PSI)
+DADT(2) = GROWTH - K2*C2*A(2)
+DADT(3) = K2*C2*A(2) - K1*A(3)
+DADT(4) = K1*(A(3) - A(4))
+DADT(5) = K1*(A(4) - A(5))
+
+$ERROR
+PKCONC = A(1)/VC
+PDRESP = A(2) + A(3) + A(4) + A(5)
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.1.AND.PKCONC.GT.0) THEN
+  IPRED = LOG(PKCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.2.AND.PDRESP.GT.0) THEN
+  IPRED = LOG(PDRESP)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 0.5) ; THETA(1) TVCL
+(0, 2) ; THETA(2) TVVC
+(0, 0.2) ; THETA(3) TVW0
+(0, 0.3) ; THETA(4) TVLAM0
+(0, 0.1) ; THETA(5) TVLAM1
+(0, 1) ; THETA(6) TVK2
+(0, 1) ; THETA(7) TVK1
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) VC
+0.2         ; ETA(3) W0
+0.2         ; ETA(4) LAM0
+0.2         ; ETA(5) LAM1
+0.2         ; ETA(6) K2
+
+$SIGMA
+0.1 ; PK log-additive error
+0.1 ; Tumor log-additive error
+
+$ESTIMATION METHOD=SAEM INTERACTION NBURN=2000 NITER=1000
+
+$ESTIMATION METHOD=IMP EONLY=1 ISAMPLE=1000 NITER=5
+; $COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output

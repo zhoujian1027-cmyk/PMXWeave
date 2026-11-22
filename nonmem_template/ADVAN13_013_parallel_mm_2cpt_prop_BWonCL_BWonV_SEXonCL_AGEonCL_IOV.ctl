@@ -1,0 +1,97 @@
+$PROBLEM ADVAN13 Michaelis-Menten elimination 2-cpt | FOCE | prop
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID BW SEX AGE OCC
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(DEPOT) COMP=(CENTRAL) COMP=(PERIPH)
+
+$PK
+; Typical values
+TVVC = THETA(1)
+TVCL = THETA(2)
+TVKA = THETA(3)
+TVVP = THETA(4)
+TVQ = THETA(5)
+TVVMAX = THETA(6)
+TVKM = THETA(7)
+
+; Covariate effects
+FBWCL = (BW/70)**0.75
+FBWV = (BW/70)**1
+IF (SEX.EQ.2) THEN
+  FSEX = THETA(8)
+ELSE
+  FSEX = 1
+ENDIF
+FAGE = (AGE/40)**THETA(9)
+
+; Occasion flags
+OCC1 = 0
+OCC2 = 0
+OCC3 = 0
+IF (OCC.EQ.1) OCC1 = 1
+IF (OCC.EQ.2) OCC2 = 1
+IF (OCC.EQ.3) OCC3 = 1
+IOVCL = OCC1*ETA(8) + OCC2*ETA(9) + OCC3*ETA(10)
+
+; Individual parameters
+VC = TVVC * EXP(ETA(1)) * FBWV
+CL = TVCL * EXP(ETA(2)) * FBWCL * FSEX * FAGE * EXP(IOVCL)
+KA = TVKA * EXP(ETA(3))
+VP = TVVP * EXP(ETA(4))
+Q = TVQ * EXP(ETA(5))
+K23 = Q/VC
+K32 = Q/VP
+VMAX = TVVMAX * EXP(ETA(6))
+KM = TVKM * EXP(ETA(7))
+
+$DES
+K12 = KA
+K20 = CL/VC
+C2 = A(2)/VC
+DADT(1) = -K12*A(1)
+DADT(2) = K12*A(1) + K32*A(3) - K23*A(2) - K20*A(2) - (VMAX*C2)/(KM+C2)
+DADT(3) = K23*A(2) - K32*A(3)
+
+$ERROR
+IPRED = A(2)/VC
+
+Y = IPRED + IPRED * EPS(1)
+
+$THETA
+(0, 50) ; THETA(1) TVVC
+(0, 5) ; THETA(2) TVCL
+(0, 1) ; THETA(3) TVKA
+(0, 50) ; THETA(4) TVVP
+(0, 10) ; THETA(5) TVQ
+(0, 10) ; THETA(6) TVVMAX
+(0, 1) ; THETA(7) TVKM
+1 ; THETA(8) SEXEFF
+(0, 1) ; THETA(9) AGEPWR
+
+$OMEGA
+0.1         ; IIV_VC
+0.1         ; IIV_CL
+0.1         ; IIV_KA
+0.1         ; IIV_VP
+0.1         ; IIV_Q
+0.1         ; IIV_VMAX
+0.1         ; IIV_KM
+
+$OMEGA 0.1         ; IOVCL1
+
+$OMEGA 0.1         ; IOVCL2
+
+$OMEGA 0.1         ; IOVCL3
+
+$SIGMA
+0.1 ; Proportional variance
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=output

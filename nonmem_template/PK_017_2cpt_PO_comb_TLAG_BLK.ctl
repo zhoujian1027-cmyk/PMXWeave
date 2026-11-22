@@ -1,0 +1,61 @@
+$PROBLEM 2-cpt PO Model | FOCE | comb
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN4 TRANS4
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVV2 = THETA(2)
+TVQ = THETA(3)
+TVV3 = THETA(4)
+TVKA = THETA(5)
+TVLAG = THETA(6)
+
+; Covariate effects
+
+; Individual parameters
+CL = TVCL * EXP(ETA(1))
+V2 = TVV2 * EXP(ETA(2))
+Q = TVQ * EXP(ETA(3))
+V3 = TVV3 * EXP(ETA(4))
+KA = TVKA * EXP(ETA(5))
+ALAG1 = TVLAG * EXP(ETA(6))
+S2 = V2
+
+$ERROR
+IPRED = F
+
+Y = IPRED + IPRED * EPS(1) + EPS(2)
+
+$THETA
+(0, 5) ; THETA(1) TVCL
+(0, 50) ; THETA(2) TVV2
+(0, 10) ; THETA(3) TVQ
+(0, 50) ; THETA(4) TVV3
+(0, 1) ; THETA(5) TVKA
+(0, 1) ; THETA(6) TVLAG
+
+$OMEGA
+BLOCK(2)
+0.2         ; ETA(1) CL
+0.01 0.2    ; ETA(2) V2
+
+$OMEGA
+0.2         ; ETA(3) Q
+0.2         ; ETA(4) V3
+0.2         ; ETA(5) KA
+0.2         ; ETA(6) ALAG
+
+$SIGMA
+0.1 ; Proportional variance
+0.1 ; Additive variance
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=output

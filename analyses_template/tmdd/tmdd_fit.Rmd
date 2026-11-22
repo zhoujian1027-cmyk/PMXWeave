@@ -1,0 +1,185 @@
+---
+title: "TMDD Model Fitting"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    fig_width: 9
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+pmx_shared <- function(f) {
+  root <- Sys.getenv("PMX_ROOT", "")
+  cand <- c(file.path("_shared", f), file.path("..", "_shared", f),
+            file.path("..", "..", "_shared", f),
+            file.path("02_html", "_shared", f),
+            file.path("analyses_template", "_shared", f))
+  if (nzchar(root))
+    cand <- c(cand, file.path(root, "_shared", f),
+              file.path(root, "02_html", "_shared", f),
+              file.path(root, "analyses_template", "_shared", f))
+  hit <- cand[file.exists(cand)]
+  if (!length(hit))
+    stop("shared fit template not found: ", f,
+         "\n  looked in: ", paste(cand, collapse = ", "), call. = FALSE)
+  hit[1]
+}
+knitr::knit_child(pmx_shared("fit_setup.Rmd"), quiet = TRUE)
+```
+
+```{r figure-layout, echo=FALSE, results='asis'}
+cat(pmx_fit_caption_style)
+```
+
+```{r switches}
+RUN_BOOTSTRAP <- FALSE   # non-parametric bootstrap CI (nlmixr2extra::bootstrapFit)
+RUN_SCM       <- FALSE   # covariate search (nlmixr2extra::covarSearchAuto)
+
+BOOT_NBOOT   <- 200      # replicate fits: each one is a full refit
+BOOT_CI      <- 0.95     # two-sided level -> percentile CI at 2.5 % / 97.5 %
+BOOT_STDERR  <- "perc"   # "perc" = percentile interval, which makes no symmetry
+BOOT_STRAT   <- NULL     # optional stratification variable, e.g. "DOSE"
+BOOT_RESTART <- FALSE    # TRUE discards the cache and starts the run over
+
+SCM_SEARCH  <- "scm"     # "scm" = forward + backward, or "forward"/"backward"
+SCM_PVAL    <- list(fwd = 0.05, bck = 0.01)   # pre-declared significance levels
+SCM_RESTART <- FALSE     # TRUE discards the cache and starts the search over
+SCM_MAP <- list(
+  tvcl  = c("AGE", "BW", "SEX", "RACE"),
+  tvvc  = c("BW"),
+  tvkss = c("BW", "ALB"),
+  tvrss = c("BW", "SEX")
+)
+SCM_CAT <- c("SEX", "RACE")
+```
+
+# Dose levels are text ("10 mg/kg", "100 nmol"), so the default alphabetical
+# order puts 10 before 3. The numeric part decides the order instead.
+dose_fct <- function(x) {
+  u <- unique(as.character(x))
+  n <- suppressWarnings(as.numeric(sub("^\\s*([0-9.]+).*$", "\\1", u)))
+  factor(as.character(x), levels = if (all(!is.na(n))) u[order(n)] else sort(u))
+}
+
+# 1. Data Overview
+
+```{r read-data}
+df <- read.csv("tmdd_data.csv", na.strings = ".")
+drug_obs <- df %>% filter(EVID == 0, CMT == 1)
+target_obs <- df %>% filter(EVID == 0, CMT == 2)
+dose_rec <- df %>% filter(EVID == 1)
+
+cov_tab <- df %>% distinct(ID, .keep_all = TRUE)
+
+summary_tab <- data.frame(
+  Metric = c("Subjects", "Total records", "Free drug observations",
+             "Total target observations", "Dose groups (mg)",
+             "Subjects per dose group", "Median BW (kg)", "% Female"),
+  Value = c(
+    nrow(cov_tab),
+    nrow(df),
+    nrow(drug_obs),
+    nrow(target_obs),
+    paste(sort(unique(cov_tab$DOSE)), collapse = ", "),
+    paste(sprintf("%s: n=%d", names(table(cov_tab$DOSE)),
+                  as.integer(table(cov_tab$DOSE))), collapse = "; "),
+    round(median(df$BW, na.rm = TRUE), 1),
+    round(100 * mean(df$SEX == 2), 1)
+  )
+)
+kable(summary_tab, caption = "Dataset Summary", align = "lc")
+```
+
+## 1.1 Covariate Summary
+
+```{r cov-summary, results='asis'}
+cov_df <- df
+con_cov <- c("AGE","BW","BMI","ALB","CRCL")
+cat_cov <- c("SEX","RACE","DOSE")
+var_labels <- pmx_fit_covariate_labels(c(AGE="Age",BW="Body weight",BMI="BMI",
+  ALB="Albumin",CRCL="Creatinine clearance",SEX="Sex",RACE="Race",DOSE="Dose level"))
+cov_table <- pmx_patient_characteristics(cov_df,con_cov,cat_cov,var_labels,
+  level_display=pmx_fit_level_display,id="ID",label_column="Covariates")
+pmx_fit_characteristics_kable(cov_table)
+```
+
+## 1.2 Free Drug Concentration-Time Profiles
+
+```{r drug-spaghetti, fig.width=9, fig.height=4, fig.cap="Individual free-drug concentration-time profiles"}
+ggplot(drug_obs, aes(TIME, DV, group = ID)) +
+  geom_line(alpha = 0.15, color = "steelblue") +
+  geom_point(size = 0.5, alpha = 0.3, color = "steelblue") +
+  scale_y_log10() +
+  labs(x = "Time (h)", y = "Free Drug (nM)") +
+  theme_bw()
+```
+
+## 1.3 Total Target-Time Profiles
+
+```{r target-spaghetti, fig.width=9, fig.height=4, fig.cap="Individual total-target profiles"}
+ggplot(target_obs, aes(TIME, DV, group = ID)) +
+  geom_line(alpha = 0.15, color = "darkred") +
+  geom_point(size = 0.5, alpha = 0.3, color = "darkred") +
+  scale_y_log10() +
+  labs(x = "Time (h)", y = "Total Target (nM)") +
+  theme_bw()
+```
+
+## 1.4 Target Suppression by Dose
+
+```{r target-suppression, fig.width=9, fig.height=4, fig.cap="Target suppression over time by dose"}
+subj_dose <- dose_rec %>% distinct(ID, AMT) %>%
+  mutate(DOSE_GRP = dose_fct(DOSE))
+
+target_plot <- target_obs %>%
+  left_join(subj_dose, by = "ID") %>%
+  left_join(
+    target_obs %>% filter(TIME == min(TIME)) %>%
+      select(ID, DV) %>% rename(BASELINE = DV),
+    by = "ID"
+  ) %>%
+  mutate(SUPPRESSION_PCT = 100 * (1 - DV / BASELINE))
+
+ggplot(target_plot, aes(TIME, SUPPRESSION_PCT, group = ID)) +
+  geom_line(alpha = 0.2, aes(color = DOSE_GRP)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey50") +
+  labs(x = "Time (h)", y = "Target Suppression (%)",
+       color = "Dose Group") +
+  theme_bw()
+```
+
+# 2. Model Fitting
+
+```{r fit-knobs, include=FALSE}
+FIT_FAM      <- "tmdd"
+FIT_SEC      <- c(save = 3, boot = 4, scm = 5)
+FIT_CTL      <- "tmdd_qss_model.ctl"
+FIT_THETA    <- c("TVCL", "TVVC", "TVKSS", "TVKDEG", "TVRSS", "TVKINT")
+FIT_ETA      <- c("ETA_CL", "ETA_VC", "ETA_KSS")
+FIT_REFIT    <- FALSE
+
+FIT_ENDPOINT <- function(m) model(m, {
+  free_drug    <- ipred
+  total_target <- ipred2
+  free_drug    ~ lnorm(sdPK)
+  total_target ~ lnorm(sdPD)
+}, append = TRUE)
+
+FIT_PREP <- function(df) df %>%
+  mutate(evid = EVID, amt = AMT, cmt = CMT, mdv = MDV,
+         dv = ifelse(EVID == 1, NA, DV),
+         dvid = ifelse(EVID == 1, 1, CMT), eps1 = 0, eps2 = 0) %>%
+  select(ID, TIME, evid, amt, cmt, mdv, dv, dvid, BW, SEX, eps1, eps2)
+```
+
+```{r fit-core, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_core.Rmd"), quiet = TRUE), sep = "\n")
+```
+
+```{r fit-tail, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_tail.Rmd"), quiet = TRUE), sep = "\n")
+```

@@ -1,0 +1,174 @@
+---
+title: "Population PK Model Fitting"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    fig_width: 9
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+pmx_shared <- function(f) {
+  root <- Sys.getenv("PMX_ROOT", "")
+  cand <- c(file.path("_shared", f), file.path("..", "_shared", f),
+            file.path("..", "..", "_shared", f),
+            file.path("02_html", "_shared", f),
+            file.path("analyses_template", "_shared", f))
+  if (nzchar(root))
+    cand <- c(cand, file.path(root, "_shared", f),
+              file.path(root, "02_html", "_shared", f),
+              file.path(root, "analyses_template", "_shared", f))
+  hit <- cand[file.exists(cand)]
+  if (!length(hit))
+    stop("shared fit template not found: ", f,
+         "\n  looked in: ", paste(cand, collapse = ", "), call. = FALSE)
+  hit[1]
+}
+knitr::knit_child(pmx_shared("fit_setup.Rmd"), quiet = TRUE)
+```
+
+```{r figure-layout, echo=FALSE, results='asis'}
+cat(pmx_fit_caption_style)
+```
+
+```{r switches}
+RUN_BOOTSTRAP <- FALSE   # non-parametric bootstrap CI (nlmixr2extra::bootstrapFit)
+RUN_SCM       <- FALSE   # covariate search (nlmixr2extra::covarSearchAuto)
+
+BOOT_NBOOT   <- 200      # replicate fits: each one is a full refit
+BOOT_CI      <- 0.95     # two-sided level -> percentile CI at 2.5 % / 97.5 %
+BOOT_STDERR  <- "perc"   # "perc" = percentile interval, which makes no symmetry
+BOOT_STRAT   <- NULL     # optional stratification variable, e.g. "DOSE"
+BOOT_RESTART <- FALSE    # TRUE discards the cache and starts the run over
+
+SCM_SEARCH  <- "scm"     # "scm" = forward + backward, or "forward"/"backward"
+SCM_PVAL    <- list(fwd = 0.05, bck = 0.01)   # pre-declared significance levels
+SCM_RESTART <- FALSE     # TRUE discards the cache and starts the search over
+SCM_MAP <- list(
+  tvvc = c("BW", "SEX"),
+  tvcl = c("AGE", "BW", "SEX", "RACE", "CRCL")
+)
+SCM_CAT <- c("SEX", "RACE")
+```
+
+# Dose levels are text ("10 mg/kg", "100 nmol"), so the default alphabetical
+# order puts 10 before 3. The numeric part decides the order instead.
+dose_fct <- function(x) {
+  u <- unique(as.character(x))
+  n <- suppressWarnings(as.numeric(sub("^\\s*([0-9.]+).*$", "\\1", u)))
+  factor(as.character(x), levels = if (all(!is.na(n))) u[order(n)] else sort(u))
+}
+
+# 1. Data Overview
+
+```{r read-data}
+df <- read.csv("ppk_data.csv", na.strings = ".")
+obs <- df %>% filter(EVID == 0)
+dose_rec <- df %>% filter(EVID == 1)
+
+cov_tab <- df %>% distinct(ID, .keep_all = TRUE)
+
+summary_tab <- data.frame(
+  Metric = c("Subjects", "Total records", "Observations", "Dosing records",
+             "Dose groups (mg)", "Subjects per dose group", "Cycles",
+             "Median BW (kg)", "% Female"),
+  Value = c(
+    nrow(cov_tab),
+    nrow(df),
+    nrow(obs),
+    nrow(dose_rec),
+    paste(sort(unique(cov_tab$DOSE)), collapse = ", "),
+    paste(sprintf("%s: n=%d", names(table(cov_tab$DOSE)),
+                  as.integer(table(cov_tab$DOSE))), collapse = "; "),
+    length(unique(df$ADY)),
+    round(median(df$BW, na.rm = TRUE), 1),
+    round(100 * mean(df$SEX == 2), 1)
+  )
+)
+kable(summary_tab, caption = "Dataset Summary", align = "lc")
+```
+
+## 1.1 Covariate Summary
+
+```{r cov-summary, results='asis'}
+cov_df <- df
+con_cov <- c("AGE","BW","BMI","ALB","CRCL")
+cat_cov <- c("SEX","RACE","DOSE")
+var_labels <- pmx_fit_covariate_labels(c(AGE="Age",BW="Body weight",BMI="BMI",
+  ALB="Albumin",CRCL="Creatinine clearance",SEX="Sex",RACE="Race",DOSE="Dose level"))
+cov_table <- pmx_patient_characteristics(cov_df,con_cov,cat_cov,var_labels,
+  level_display=pmx_fit_level_display,id="ID",label_column="Covariates")
+pmx_fit_characteristics_kable(cov_table)
+```
+
+## 1.2 Concentration-Time Profiles (Spaghetti)
+
+```{r spaghetti, fig.width=10, fig.height=5, fig.cap="Individual concentration-time profiles"}
+obs_dose <- obs %>%
+  select(-AMT) %>%
+  left_join(dose_rec %>% distinct(ID, AMT), by = "ID") %>%
+  mutate(DOSE_LBL = factor(paste0("Dose: ", DOSE),
+                           levels = paste0("Dose: ", levels(dose_fct(DOSE)))))
+
+ggplot(obs_dose, aes(TIME, DV, group = ID)) +
+  geom_line(alpha = 0.15, color = "steelblue") +
+  geom_point(size = 0.5, alpha = 0.3, color = "steelblue") +
+  scale_y_log10() +
+  facet_wrap(~ DOSE_LBL) +
+  labs(x = "Time (h)", y = "Concentration (ng/mL)") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+## 1.3 Concentration-Time by Dose (Summary)
+
+```{r conc-summary, fig.width=9, fig.height=4, fig.cap="Mean concentration-time profiles by dose group"}
+obs %>%
+  group_by(DOSE, TIME) %>%
+  summarise(
+    GeoMean = exp(mean(log(DV), na.rm = TRUE)),
+    N = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(TIME, GeoMean, color = dose_fct(DOSE))) +
+  geom_line() +
+  geom_point() +
+  scale_y_log10() +
+  labs(x = "Time (h)", y = "Geometric Mean Concentration (ng/mL)",
+       color = "Dose (mg)") +
+  theme_bw()
+```
+
+# 2. Model Fitting
+
+```{r fit-knobs, include=FALSE}
+FIT_FAM      <- "ppk"
+FIT_SEC      <- c(save = 3, boot = 4, scm = 5)
+FIT_CTL      <- "base_model.ctl"
+FIT_THETA    <- c("TVVC", "TVCL", "TVKA1", "TVKA2", "TVALAG2", "TVF1")
+FIT_ETA      <- c("ETA_VC", "ETA_CL", "ETA_F1")
+FIT_REFIT    <- FALSE
+
+FIT_ENDPOINT <- function(m) model(m, {
+  conc <- f
+  conc ~ prop(sdRes)
+}, append = TRUE)
+
+FIT_PREP <- function(df) df %>%
+  transmute(id = ID, time = TIME, evid = EVID, amt = AMT,
+            cmt = ifelse(EVID == 1, CMT, 3), mdv = MDV,
+            dv = ifelse(EVID == 1, NA, DV), dvid = 1L,
+            eps1 = 0, eps2 = 0)
+```
+
+```{r fit-core, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_core.Rmd"), quiet = TRUE), sep = "\n")
+```
+
+```{r fit-tail, results='asis', echo=FALSE}
+cat(knitr::knit_child(pmx_shared("fit_tail.Rmd"), quiet = TRUE), sep = "\n")
+```

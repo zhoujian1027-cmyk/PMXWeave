@@ -1,0 +1,77 @@
+$PROBLEM ADVAN5 Transit-Compartment Absorption 3-cpt | NTR=3 | FOCE | prop
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN5 TRANS1
+
+$MODEL COMP=(TRANSIT1, DEFDOSE) COMP=(TRANSIT2) COMP=(TRANSIT3) COMP=(CENTRAL, DEFOBSERVATION) COMP=(PERIPH1) COMP=(PERIPH2)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVV2 = THETA(2)
+TVMTT = THETA(3)
+TVQ3 = THETA(4)
+TVV3 = THETA(5)
+TVQ4 = THETA(6)
+TVV4 = THETA(7)
+
+; Covariate effects
+
+; Individual parameters
+CL = TVCL * EXP(ETA(1))
+V2 = TVV2 * EXP(ETA(2))
+MTT = TVMTT * EXP(ETA(3))
+Q3 = TVQ3 * EXP(ETA(4))
+V3 = TVV3 * EXP(ETA(5))
+Q4 = TVQ4 * EXP(ETA(6))
+V4 = TVV4 * EXP(ETA(7))
+
+; Transit absorption chain
+NTR = 3
+KTR = NTR/MTT
+
+; ADVAN5/TRANS1 rate constants
+K12 = KTR
+K23 = KTR
+K34 = KTR
+K40 = CL/V2
+K45 = Q3/V2
+K54 = Q3/V3
+K46 = Q4/V2
+K64 = Q4/V4
+S4 = V2
+
+$ERROR
+IPRED = F
+
+Y = IPRED + IPRED * EPS(1)
+
+$THETA
+(0, 5) ; THETA(1) TVCL
+(0, 50) ; THETA(2) TVV2
+(0, 5) ; THETA(3) TVMTT
+(0, 10) ; THETA(4) TVQ3
+(0, 50) ; THETA(5) TVV3
+(0, 10) ; THETA(6) TVQ4
+(0, 50) ; THETA(7) TVV4
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) V2
+0.2         ; ETA(3) MTT
+0.2         ; ETA(4) Q3
+0.2         ; ETA(5) V3
+0.2         ; ETA(6) Q4
+0.2         ; ETA(7) V4
+
+$SIGMA
+0.1 ; Proportional variance
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=output

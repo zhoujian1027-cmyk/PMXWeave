@@ -1,0 +1,33 @@
+variable,label,description,type,unit,code,value_label,status,notes,endpoint_unit,unit_status
+ID,Subject identifier,Unique subject identifier; repeated records belong to the same simulated patient.,identifier,,,,confirmed,,,not_applicable
+TIME,Time,Elapsed time from the first administration.,time,h,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+DV,Observed PK or PD response,Original natural-scale measurement: DVID=1 is central-compartment drug concentration; DVID=2 is the turnover response.,observation,endpoint-specific,,,confirmed,Dropped from the estimation input in favour of LNDV. Confirmed natural-scale units: DVID=1 PK concentration in mg/L; DVID=2 PD turnover response in arbitrary units. See DVID endpoint_unit.,,confirmed
+LNDV,Natural-log observed response,Natural logarithm of the numerical original DV. The model aliases DV=LNDV; do not log this column again.,observation,1,,,confirmed,The reference scale is the natural-scale endpoint unit documented under DV and the endpoint selector.,,confirmed
+AMT,Dose amount,"Absolute administered amount. On dosing rows, AMT equals the mg/kg dose level multiplied by BW in kg.",dose,mg,,,confirmed,,,confirmed
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,0,Observation,confirmed,,,not_applicable
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,1,Dose administration,confirmed,,,not_applicable
+CMT,Source compartment or endpoint selector,Source CMT=1 identifies central dosing/PK records; CMT=2 on observation rows identifies the PD endpoint.,event,,1,Central dose or PK observation,confirmed,Do not equate PD observation code 2 with physical model state A(2). The PD turnover state is A(3); DVID selects its observation branch.,,not_applicable
+CMT,Source compartment or endpoint selector,Source CMT=1 identifies central dosing/PK records; CMT=2 on observation rows identifies the PD endpoint.,event,,2,PD observation selector,confirmed,Do not equate PD observation code 2 with physical model state A(2). The PD turnover state is A(3); DVID selects its observation branch.,,not_applicable
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,0,Usable observation,confirmed,,,not_applicable
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,1,DV not used as an observation,confirmed,,,not_applicable
+ADDL,Additional doses,Number of additional doses implied by this record; all values are zero in the current dataset.,regimen,,,,confirmed,,,not_applicable
+II,Interdose interval,Interval used with ADDL or steady-state dosing; all values are zero because administrations are explicit records.,regimen,h,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+RATE,Infusion rate,Administration rate; all values are zero for the current IV bolus records.,regimen,mg/h,,,confirmed,,,confirmed
+STUDYID,Study,Study identifier; all simulated records belong to Study 101.,study,,101,Study 101,confirmed,,,not_applicable
+DVID,Observation endpoint,Endpoint selector for the log-additive residual branch.,endpoint,,1,PK concentration,confirmed,Endpoint identity is defined by the control stream; measurement unit explicitly confirmed by the user.,mg/L,confirmed
+DVID,Observation endpoint,Endpoint selector for the log-additive residual branch.,endpoint,,2,PD turnover response,confirmed,Endpoint identity is defined by the control stream; measurement unit explicitly confirmed by the user.,arbitrary units,confirmed
+BW,Body weight,Baseline body weight.,continuous,kg,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+SEX,Sex,Recorded sex category.,categorical,,1,Male,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+SEX,Sex,Recorded sex category.,categorical,,2,Female,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+AGE,Age,Baseline age.,continuous,years,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+RACE,Race,Recorded race category.,categorical,,1,White,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,2,Asian,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,3,Black or African American,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,4,Other,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+WTBL,Baseline body weight,Baseline body-weight alias; exactly duplicates BW in the current dataset.,continuous,kg,,,confirmed,"Keep the original column, but do not count BW and WTBL as independent covariates.",,confirmed
+BMI,Body mass index,Baseline body mass index.,continuous,kg/m2,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+ALB,Albumin,Baseline albumin concentration.,continuous,g/dL,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+CRCL,Creatinine clearance,Baseline creatinine clearance.,continuous,mL/min,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+DOSE,Dose level,Weight-normalized dose-group label. Absolute administered dose is stored separately in AMT.,regimen,mg/kg,1 mg/kg,1 mg/kg,confirmed,,,confirmed
+DOSE,Dose level,Weight-normalized dose-group label. Absolute administered dose is stored separately in AMT.,regimen,mg/kg,3 mg/kg,3 mg/kg,confirmed,,,confirmed
+DOSE,Dose level,Weight-normalized dose-group label. Absolute administered dose is stored separately in AMT.,regimen,mg/kg,10 mg/kg,10 mg/kg,confirmed,,,confirmed

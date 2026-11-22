@@ -1,0 +1,27 @@
+$PARAM TVCLBASE = 5, TVV = 50, TVEMAX = 0.1, TVT50 = 24, TVGAM = 1
+
+$CMT CENTRAL
+
+$OMEGA
+0.09 0.02
+
+$SIGMA
+0.1
+
+$MAIN
+double CLBASE = TVCLBASE * exp(ETA(1));
+double EMAX = TVEMAX + ETA(2);
+double V = TVV;
+
+$ODE
+double EMAXv = EMAX * pow(SOLVERTIME, TVGAM) / (pow(TVT50, TVGAM) + pow(SOLVERTIME, TVGAM));
+double CLT = CLBASE * exp(EMAXv);
+dxdt_CENTRAL = -(CLT / V) * CENTRAL;
+
+$TABLE
+double IPRED = CENTRAL / V;
+
+double DV = IPRED + IPRED * EPS(1);
+
+$CAPTURE IPRED DV CLT
+

@@ -1,0 +1,100 @@
+$PROBLEM ADVAN13 parent_metabolite_Emax IV 2-cpt | FOCE
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID SEX AGE
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(CENTRAL) COMP=(PERIPH) COMP=(METAB)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVV1 = THETA(2)
+TVQ = THETA(3)
+TVV2 = THETA(4)
+TVVMAX = THETA(5)
+TVKM = THETA(6)
+TVCLM = THETA(7)
+TVVM = THETA(8)
+
+; Covariate effects
+IF (SEX.EQ.2) THEN
+  FSEX = THETA(9)
+ELSE
+  FSEX = 1
+ENDIF
+FAGE = (AGE/40)**THETA(10)
+
+; Parent PK parameters
+CL = TVCL * EXP(ETA(1)) * FSEX * FAGE
+V1 = TVV1 * EXP(ETA(2))
+Q = TVQ * EXP(ETA(3))
+V2 = TVV2 * EXP(ETA(4))
+
+; Metabolite formation (Emax/saturable) & disposition
+VMAX = TVVMAX * EXP(ETA(5))
+KM = TVKM * EXP(ETA(6))
+CLM = TVCLM * EXP(ETA(7))
+VM = TVVM * EXP(ETA(8))
+
+$DES
+K20 = CL/V1
+K23 = Q/V1
+K32 = Q/V2
+K40 = CLM/VM
+C2 = A(1)/V1    ; parent concentration
+RATE_FORM = VMAX*C2/(KM + C2)    ; saturable metabolite formation (Amt/Time)
+DADT(1) = -K20*A(1) + K32*A(2) - K23*A(1) - RATE_FORM
+DADT(2) = K23*A(1) - K32*A(2)
+DADT(3) = RATE_FORM - K40*A(3)
+
+$ERROR
+PARENTCONC = A(1)/V1
+METABCONC = A(3)/VM
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.1.AND.PARENTCONC.GT.0) THEN
+  IPRED = LOG(PARENTCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.3.AND.METABCONC.GT.0) THEN
+  IPRED = LOG(METABCONC)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 5) ; THETA(1) TVCL
+(0, 50) ; THETA(2) TVV1
+(0, 10) ; THETA(3) TVQ
+(0, 50) ; THETA(4) TVV2
+(0, 10) ; THETA(5) TVVMAX
+(0, 1) ; THETA(6) TVKM
+(0, 5) ; THETA(7) TVCLM
+(0, 50) ; THETA(8) TVVM
+1 ; THETA(9) SEXEFF
+(0, 1) ; THETA(10) AGEPWR
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) V1
+0.2         ; ETA(3) Q
+0.2         ; ETA(4) V2
+0.2         ; ETA(5) VMAX
+0.2         ; ETA(6) KM
+0.2         ; ETA(7) CLM
+0.2         ; ETA(8) VM
+
+$SIGMA
+0.1 ; Parent log-additive error
+0.1 ; Metabolite log-additive error
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output

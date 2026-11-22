@@ -1,0 +1,52 @@
+$PROBLEM 1-cpt PO Model | FOCE | comb
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID SEX
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN2 TRANS2
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVV = THETA(2)
+TVKA = THETA(3)
+
+; Covariate effects
+IF (SEX.EQ.2) THEN
+  FSEX = THETA(4)
+ELSE
+  FSEX = 1
+ENDIF
+
+; Individual parameters
+CL = TVCL * EXP(ETA(1)) * FSEX
+V = TVV * EXP(ETA(2))
+KA = TVKA * EXP(ETA(3))
+S2 = V
+
+$ERROR
+IPRED = F
+
+Y = IPRED + IPRED * EPS(1) + EPS(2)
+
+$THETA
+(0, 5) ; THETA(1) TVCL
+(0, 50) ; THETA(2) TVV
+(0, 1) ; THETA(3) TVKA
+1 ; THETA(4) SEXEFF
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) V
+0.2         ; ETA(3) KA
+
+$SIGMA
+0.1 ; Proportional variance
+0.1 ; Additive variance
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=output

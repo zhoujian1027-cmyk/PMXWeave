@@ -1,0 +1,87 @@
+```{r fit-head-save, results='asis', echo=FALSE}
+cat(sprintf("\n# %s. Estimation Results Saved\n\n", FIT_SEC[["save"]]))
+```
+
+```{r save-estimates}
+nlmixr2save::saveFit(fit, paste0(FIT_FAM, "_estimates"))
+
+write.csv(as.data.frame(fit$eta), file = paste0(FIT_FAM, "_ebe.csv"), row.names = FALSE)
+
+cat("Saved", paste0(FIT_FAM, "_estimates.zip"), "| OBJF:", sprintf("%.3f", fit$objf),
+    "| fitted names:", paste(names(fixef(fit)), collapse = ", "), "\n")
+```
+
+```{r fit-head-boot, results='asis', echo=FALSE}
+cat(sprintf("\n# %s. Optional: Bootstrap Confidence Intervals\n\n", FIT_SEC[["boot"]]))
+```
+
+```{r bootstrap, eval=RUN_BOOTSTRAP, fig.width=9, fig.height=6}
+dir.create(paste0(FIT_FAM, "_bootstrap_cache"), showWarnings = FALSE)
+boot_args <- list(fit = fit, nboot = BOOT_NBOOT, stdErrType = BOOT_STDERR,
+                  ci = BOOT_CI, returnType = "model", restart = BOOT_RESTART,
+                  fitName = FIT_FAM)
+if (!is.null(BOOT_STRAT)) boot_args$stratVar <- BOOT_STRAT
+fit_boot <- rxode2::.rxWithWd(paste0(FIT_FAM, "_bootstrap_cache"),
+                              do.call(nlmixr2extra::bootstrapFit, boot_args))
+assign("bootCI", BOOT_CI, envir = fit_boot$env)
+nlmixr2save::saveFit(fit_boot, paste0(FIT_FAM, "_bootstrap"))
+
+bs <- lapply(fit_boot$bootSummary$parFixedDf, as.data.frame)
+cat("Bootstrap done -", nrow(bs$mean), "parameters,",
+    sprintf("%.0f %% percentile CI:", 100 * BOOT_CI), "\n")
+print(data.frame(Parameter = rownames(bs$confLower),
+                 Estimate  = bs$mean$Estimate,
+                 Lower     = bs$confLower$Estimate,
+                 Upper     = bs$confUpper$Estimate,
+                 row.names = NULL))
+```
+
+```{r fit-head-scm, results='asis', echo=FALSE}
+cat(sprintf("\n# %s. Optional: Covariate Search (SCM)\n\n", FIT_SEC[["scm"]]))
+```
+
+```{r scm, eval=RUN_SCM}
+cat("covarSearchAuto() cannot be used on a model with alag()/f(); see HANDOVER.md 13.14 - the search is run by word-report/run_pipeline.R\n")
+if (FALSE) {  # covarSearchAuto() lane disabled on purpose: see HANDOVER.md 13.14 - kept for reference
+mu_ok <- tryCatch(nrow(fit$finalUiEnv$muRefDataFrame) > 0, error = function(e) FALSE)
+if (!mu_ok)
+  stop("SCM: the fitted model is not mu-referenced the way nlmixr2extra needs ",
+       "(muRefDataFrame is empty), so covarSearchAuto() cannot add a covariate ",
+       "to it.  See the comment above this chunk.", call. = FALSE)
+
+dir.create(paste0(FIT_FAM, "_scm_cache"), showWarnings = FALSE)
+scm_forward <- list()
+fit_scm <- fit
+for (p in names(SCM_MAP)) {
+  covs <- SCM_MAP[[p]]
+  if (!length(covs)) next
+  r <- rxode2::.rxWithWd(paste0(FIT_FAM, "_scm_cache"), nlmixr2extra::covarSearchAuto(
+    fit_scm, varsVec = p, covarsVec = covs,
+    catvarsVec = intersect(covs, SCM_CAT),
+    pVal = SCM_PVAL, searchType = "forward", restart = SCM_RESTART))
+  scm_forward[[length(scm_forward) + 1L]] <- r$resFwd[[2]]
+  fit_scm <- r$resFwd[[1]]
+}
+scm_record <- do.call(rbind, scm_forward)
+rownames(scm_record) <- NULL
+
+if (SCM_SEARCH %in% c("scm", "backward") && any(scm_record$included == "yes")) {
+  r <- rxode2::.rxWithWd(paste0(FIT_FAM, "_scm_cache"), nlmixr2extra::covarSearchAuto(
+    fit_scm, varsVec = names(SCM_MAP), covarsVec = unique(unlist(SCM_MAP)),
+    catvarsVec = intersect(unique(unlist(SCM_MAP)), SCM_CAT),
+    pVal = SCM_PVAL, searchType = "backward", restart = SCM_RESTART))
+  scm_record <- rbind(scm_record, r$resBck[[2]])
+  fit_scm <- r$resBck[[1]]
+}
+
+write.csv(scm_record, paste0(FIT_FAM, "_scm_record.csv"), row.names = FALSE)
+
+scm_kept <- scm_record[scm_record$included == "yes", , drop = FALSE]
+if (nrow(scm_kept)) {
+  nlmixr2save::saveFit(fit_scm, paste0(FIT_FAM, "_scm_final"))
+  cat("SCM kept:", paste(unique(scm_kept$covNames), collapse = ", "), "\n")
+} else {
+  cat("SCM kept no covariate effect; stage 3 will report the base model.\n")
+}
+}  # end disabled covarSearchAuto() lane (HANDOVER.md 13.14)
+```

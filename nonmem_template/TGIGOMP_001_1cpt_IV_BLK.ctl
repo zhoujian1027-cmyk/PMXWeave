@@ -1,0 +1,85 @@
+$PROBLEM Gompertz-Emax TGI 1-cpt IV | FOCE
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(CENTRAL) COMP=(TUMOR)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVVC = THETA(2)
+TVW0 = THETA(3)
+TVALPHA0 = THETA(4)
+TVBETA = THETA(5)
+TVEMAX = THETA(6)
+TVEC50 = THETA(7)
+
+; PK parameters
+CL = TVCL * EXP(ETA(1))
+VC = TVVC * EXP(ETA(2))
+
+; Tumor growth/kill parameters
+W0 = TVW0 * EXP(ETA(3))
+ALPHA0 = TVALPHA0 * EXP(ETA(4))
+BETA = TVBETA
+EMAX = TVEMAX * EXP(ETA(5))
+EC50 = TVEC50
+A_0(2) = W0
+
+$DES
+K10 = CL/VC
+DADT(1) = -K10*A(1)
+C2 = A(1)/VC    ; drug concentration
+GROWTH = ALPHA0*EXP(-BETA*T)    ; Gompertzian specific growth rate
+INHIB = EMAX*C2/(EC50+C2)    ; saturable drug-driven inhibition
+DADT(2) = (GROWTH - INHIB)*A(2)    ; tumor mass
+
+$ERROR
+PKCONC = A(1)/VC
+PDRESP = A(2)
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.1.AND.PKCONC.GT.0) THEN
+  IPRED = LOG(PKCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.2.AND.PDRESP.GT.0) THEN
+  IPRED = LOG(PDRESP)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 0.5) ; THETA(1) TVCL
+(0, 2) ; THETA(2) TVVC
+(0, 0.2) ; THETA(3) TVW0
+(0, 0.3) ; THETA(4) TVALPHA0
+(0, 0.05) ; THETA(5) TVBETA
+(0, 1) ; THETA(6) TVEMAX
+(0, 10) ; THETA(7) TVEC50
+
+$OMEGA
+BLOCK(2)
+0.2         ; ETA(1) CL
+0.01 0.2    ; ETA(2) VC
+
+$OMEGA
+0.2         ; ETA(3) W0
+0.2         ; ETA(4) ALPHA0
+0.2         ; ETA(5) EMAX
+
+$SIGMA
+0.1 ; PK log-additive error
+0.1 ; Tumor log-additive error
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output

@@ -1,0 +1,1348 @@
+---
+title: "Concentration-QTc Analysis Report"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    fig_width: 9
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+.cpu_paths <- c(file.path(dirname(Sys.getenv("STAGES_DIR")),"cpu_budget.R"),
+                file.path(Sys.getenv("PMX_TOOLKIT"),"word-report","cpu_budget.R"),
+                ".pmx/word-report/cpu_budget.R", ".pmx/pmx_workspace/word-report/cpu_budget.R",
+                "../.pmx/pmx_workspace/word-report/cpu_budget.R", "word-report/cpu_budget.R")
+.cpu_path <- .cpu_paths[file.exists(.cpu_paths)][1]
+if(is.na(.cpu_path)) stop("PMX_CPU_TOOLKIT_REQUIRED: complete reusable toolkit required")
+source(.cpu_path)
+pmx_cpu_setup(threads=1L)
+knitr::opts_chunk$set(error=FALSE,
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 4
+)
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(haven)   # read SAS
+library(knitr)
+library(gridExtra)
+```
+
+```{r switches}
+DATA_FILE    <- Sys.getenv("PMX_DATA", "")            # "" = discover the single csv in this directory
+STUDY_ID     <- ""            # "" = read STUDYID off the table
+DRUG         <- "drug"
+INDICATION   <- ""            # "" = not stated in the table
+MATRIX       <- ""            # "" = not stated in the table
+LAB          <- ""            # "" = not stated in the table
+ANALYTE_NAME <- ""            # "" = the PCTEST analyte with the most records
+AUTHOR       <- "PMX Agent"
+OUT_DIR      <- Sys.getenv("PMX_OUTPUT_DIR", "output")
+QT_CHANGE_SOURCE <- "auto"
+CONC_UNIT    <- ""            # Unit of PKCONC in the input, e.g. ng/mL; do not enter the analyte name.
+HYSTERESIS_VIEW <- "individual" # "individual" for patient panels; "overview" for dose-group overlay.
+HYSTERESIS_PANELS <- 12L       # Maximum patient panels per figure.
+PAIRING_METHOD <- ""          # Source PK/ECG matching rule, e.g. same visit and nominal time.
+BASELINE_DEFINITION <- ""     # Source baseline rule, e.g. mean of predose QTcF.
+
+cq_note <- function(...) cat(..., file = stderr())
+
+# Categorical reference levels
+mode_level <- function(x) {
+  x <- as.character(x); x <- x[!is.na(x)]
+  if (!length(x)) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[[1]]
+}
+
+cat_counts <- function(d, v) {
+  if("USUBJID" %in% names(d)) d <- d[!duplicated(d$USUBJID),,drop=FALSE]
+  lv <- as.character(d[[v]]); lv <- lv[!is.na(lv)]
+  if (!length(lv))
+    return(data.frame(level = character(0), N = integer(0), rank = integer(0),
+                      stringsAsFactors = FALSE))
+  tb <- sort(table(lv), decreasing = TRUE)
+  data.frame(level = names(tb), N = as.integer(tb), rank = seq_along(tb),
+             stringsAsFactors = FALSE)
+}
+
+# Fitted reference level
+cat_ref_level <- function(d, v, fit = NULL) {
+  if (!is.null(fit)) {
+    mf <- tryCatch(stats::model.frame(fit), error = function(e) NULL)
+    if (!is.null(mf) && v %in% names(mf) && is.factor(mf[[v]])) return(levels(mf[[v]])[1])
+  }
+  x <- d[[v]]
+  lv <- if (is.factor(x)) levels(x) else levels(factor(as.character(x)))
+  if (length(lv)) lv[1] else NA_character_
+}
+
+# Coefficient level
+cat_level_of_term <- function(d, v, term) {
+  x <- d[[v]]
+  lvls <- if (is.factor(x)) levels(x) else levels(factor(as.character(x)))
+  cand <- lvls[vapply(lvls, function(l) identical(paste0(v, l), as.character(term)),
+                      logical(1))]
+  if (length(cand)) return(cand[which.max(nchar(cand))])
+  sub(paste0("^", v), "", as.character(term))
+}
+
+# "<level> : <reference> (N = n : n_ref)" - the numbers are read off the data frame.
+cat_effect_label <- function(d, v, level, ref = NULL, fit = NULL) {
+  if(!is.null(fit)) {
+    mf <- model.frame(fit)
+    if(!"USUBJID" %in% names(mf) && "USUBJID" %in% names(d)) {
+      fitted_rows <- match(rownames(mf),rownames(d))
+      if(anyNA(fitted_rows)) stop("Cannot align categorical comparison counts to fitted records")
+      mf$USUBJID <- d$USUBJID[fitted_rows]
+    }
+    d <- mf
+  }
+  cc <- cat_counts(d, v)
+  if (is.null(ref)) ref <- cat_ref_level(d, v, fit)
+  n_of <- function(l) {
+    i <- which(cc$level == as.character(l))
+    if (length(i)) cc$N[i[1]] else NA_integer_
+  }
+  sprintf("%s : %s (N = %d : %d)", cat_level_display(v, level), cat_level_display(v, ref),
+          n_of(level), n_of(ref))
+}
+
+# Factor reference levels
+set_cat_ref <- function(d, vars, ref = NULL) {
+  releveled <- character(0)
+  want_for <- function(v) {
+    r <- if (is.null(ref)) cov_ref else ref
+    if (is.null(r) || !length(r)) return("modal")
+    if (length(r) == 1 && (is.null(names(r)) || !nzchar(names(r)[1]))) return(as.character(r)[1])
+    if (v %in% names(r)) return(as.character(r[[v]]))
+    "modal"
+  }
+  for (v in intersect(vars, names(d))) {
+    x <- d[[v]]
+    if(!v %in% cov_categorical) next
+    f <- factor(as.character(x))
+    if (nlevels(f) < 2) { d[[v]] <- f; next }
+    want <- want_for(v)
+    top <- if (identical(want, "modal")) mode_level(if("USUBJID" %in% names(d)) d[[v]][!duplicated(d$USUBJID)] else f) else {
+      if (want %in% levels(f)) want else {
+        cq_note("CQTC_SCHEMA_REF_UNKNOWN ", v, ": cov_ref level '", want,
+                "' is not in the data - using the most frequent level\n")
+        mode_level(f)
+      }
+    }
+    if (!is.na(top)) {
+      if (levels(f)[1] != top) releveled[v] <- levels(f)[1]
+      f <- stats::relevel(f, ref = top)
+    }
+    d[[v]] <- f
+  }
+  list(data = d, releveled = releveled)
+}
+
+check_cat_ref <- function(d, vars, fit = NULL) {
+  if(!is.null(fit)) d <- model.frame(fit)
+  for (v in intersect(vars, names(d))) {
+    rx <- d[[v]]
+    if(!v %in% cov_categorical) next
+    cc <- cat_counts(d, v)
+    if (!nrow(cc)) next
+    rr <- cat_ref_level(d, v, fit)
+    if (!is.na(rr) && !identical(as.character(rr), as.character(cc$level[1])))
+      message("CQTC_SCHEMA_REF_NOT_LARGEST ", v, ": model reference '", rr,
+              "' is not the most frequent level '", cc$level[1],
+              "' - re-check the labels for this covariate")
+  }
+}
+
+# Categorical comparison labels
+add_cat_labels <- function(tab, vars, d, fit = NULL) {
+  lv <- rownames(tab)
+  if (is.null(lv)) return(tab)
+  lab <- vapply(lv, function(t) {
+    hit <- vars[vapply(vars, function(v) startsWith(as.character(t), v), logical(1))]
+    if (!length(hit)) return(NA_character_)
+    v <- hit[which.max(nchar(hit))]
+    x <- d[[v]]
+    if(!v %in% cov_categorical)
+      return(sprintf("%s (continuous)", cov_display(v)))
+    cat_effect_label(d, v, cat_level_of_term(d, v, t), fit = fit)
+  }, character(1))
+  if (any(!is.na(lab))) tab[["Comparison (N)"]] <- lab
+  tab
+}
+
+# Random-effects structure
+CQTC_RE_LADDER <- c("(PKCONC | USUBJID)", "(1 | USUBJID)")
+
+cq_conv_msg <- function(fit) {
+  if (!inherits(fit, "merMod")) return(NULL)
+  msg <- fit@optinfo$conv$lme4$messages
+  if (is.null(msg)) NULL else gsub("\n", " ", paste(msg, collapse = "; "))
+}
+
+# A warning-bearing/singular candidate is not eligible for BIC or a reported final slope.
+fit_valid <- function(fit) {
+  if(is.null(fit)) return(FALSE)
+  if(!inherits(fit,"merMod")) return(all(is.finite(stats::coef(fit))) && all(is.finite(stats::vcov(fit))))
+  code <- fit@optinfo$conv$opt
+  clean_code <- !is.numeric(code) || all(is.finite(code) & code==0)
+  notes <- c(cq_conv_msg(fit),attr(fit,"pmx_fit_warnings"))
+  bad <- any(grepl("failed to converge|degenerate.*Hessian|unable to evaluate.*gradient|nearly unidentifiable|negative eigenvalue",notes,ignore.case=TRUE))
+  clean_code && !bad && is.null(cq_conv_msg(fit)) && !lme4::isSingular(fit) &&
+    all(is.finite(lme4::fixef(fit))) && all(is.finite(as.matrix(stats::vcov(fit))))
+}
+cq_is_clean <- function(fit) fit_valid(fit)
+
+cq_fit_at <- function(re, fixed_rhs, data) {
+  rhs <- if (identical(re, "none")) fixed_rhs else paste(fixed_rhs, "+", re)
+  warnings <- character()
+  fit <- tryCatch(withCallingHandlers(
+    if (identical(re, "none"))
+      stats::lm(stats::as.formula(paste("CFBQTCF ~", rhs)), data = data)
+    else lme4::lmer(stats::as.formula(paste("CFBQTCF ~", rhs)), REML = FALSE, data = data),
+    warning=function(w) {warnings <<- c(warnings,conditionMessage(w));invokeRestart("muffleWarning")}),
+    error = function(e) {cq_note("CQTC_FIT_ERROR ",re," on ",fixed_rhs,": ",conditionMessage(e),"\n");NULL})
+  if(!is.null(fit)) attr(fit,"pmx_fit_warnings") <- warnings
+  fit
+}
+
+cq_choose_re <- function(fixed_rhs, data) {
+  for (re in CQTC_RE_LADDER) {
+    fit <- cq_fit_at(re, fixed_rhs, data)
+    if (cq_is_clean(fit)) return(list(fit = fit, re = re))
+    if (!is.null(fit)) {
+      reason <- if (lme4::isSingular(fit)) "singular" else {
+        m <- cq_conv_msg(fit); if (is.null(m)) "invalid" else m }
+      cq_note("CQTC_RE_UNUSABLE ", re, " on ", fixed_rhs, ": ", reason, "\n")
+    }
+  }
+  cq_note("CQTC_RE_NONE lmer unusable for this dataset; reporting fixed effects only\n")
+  list(fit = cq_fit_at("none", fixed_rhs, data), re = "none")
+}
+
+# Refit with the selected structure
+cq_fit <- function(fixed_rhs, data, re = NULL) {
+  if (!is.null(re)) {
+    fit <- cq_fit_at(re, fixed_rhs, data)
+    if (fit_valid(fit)) {
+      msg <- cq_conv_msg(fit)
+      if (!is.null(msg)) cq_note("CQTC_CONVERGENCE_WARNING ", re, ": ", msg, "\n")
+      attr(fit, "re_struct") <- re
+      return(fit)
+    }
+    cq_note("CQTC_RE_UNUSABLE_ON_SUBSET ", re, "; refitting this subset on the ladder\n")
+  }
+  chosen <- cq_choose_re(fixed_rhs, data)
+  fit <- chosen$fit
+  if(!fit_valid(fit)) stop("CQTC_FIT_UNUSABLE: no clean fit on the existing random-effects ladder")
+  attr(fit, "re_struct") <- chosen$re
+  fit
+}
+```
+
+```{r covariate-config}
+# Covariate configuration
+
+# Covariate candidates
+cov_want <- c("AGE", "RACE", "SEX", "AETHNIC", "ECOGBL", "TUMTP", "BQTCF")
+
+# Covariate names and units
+cov_label <- c(
+  AGE     = "Age (years)",
+  RACE    = "Race",
+  SEX     = "Sex",
+  AETHNIC = "Ethnicity",
+  ECOGBL  = "ECOG performance status",
+  TUMTP   = "Tumour type",
+  BQTCF   = "Baseline QTcF (ms)"
+)
+
+# Categorical labels
+cov_levels <- list(
+  SEX    = c(M = "Male", F = "Female"),
+  ECOGBL = c("0" = "0", "1" = "1", "2" = "2"),
+  RACE   = c(White = "White", Asian = "Asian")
+)
+
+# Categorical references
+cov_ref <- "modal"
+cov_categorical <- c("RACE","SEX","AETHNIC","ECOGBL","TUMTP")
+mandatory_cov <- c("BQTCF") # Prespecified base-model adjustment; optional covariates are screened on top.
+CONFIG <- Sys.getenv("PMX_CONFIG","")
+.intake_helper <- file.path(dirname(.cpu_path),"..","analyses_template","tools","covariate_intake.R")
+if(!file.exists(.intake_helper)) stop("PMX_COVARIATE_TOOLKIT_REQUIRED: analyses_template/tools/covariate_intake.R is missing")
+source(.intake_helper)
+.covariate_review <- pmx_covariate_intake(CONFIG,"cqtc")
+
+# Display name of a covariate (cov_label map; unlisted covariates keep their name).
+cov_display <- function(v) {
+  v <- as.character(v)
+  hit <- match(v, names(cov_label))
+  ifelse(is.na(hit), v, as.character(cov_label[hit]))
+}
+# The printed name of a categorical level (cov_levels map; unlisted levels as-is).
+cat_level_display <- function(v, l) {
+  m <- cov_levels[[v]]
+  l <- as.character(l)
+  hit <- match(l, names(m))
+  ifelse(is.na(hit), l, as.character(m[hit]))
+}
+
+cq_format_coef <- function(x) vapply(x,function(value) {
+  if(!is.finite(value)) return("NE")
+  a <- abs(value); if(a==0) return("0")
+  if(a<0.0001) return(sub("e([+-])0+","e\\1",formatC(value,digits=1,format="e")))
+  places <- if(a>=1) 2 else max(2,1-floor(log10(a)))
+  sub("\\.$","",sub("0+$","",formatC(value,digits=places,format="f")))
+},"",USE.NAMES=FALSE)
+
+cq_kable <- function(d,...) {
+  shown <- d; prefixes <- attr(d,"bold_labels")
+  shown[] <- lapply(shown,function(x) {x <- as.character(x);x[is.na(x)] <- "";htmltools::htmlEscape(x)})
+  column <- intersect(c("Covariate","Variables","Characteristic"),names(d))[1]
+  if(!is.na(column)) for(i in seq_len(nrow(d))) {
+    label <- as.character(d[[column]][i])
+    if(startsWith(label,"\u00a0")) shown[[column]][i] <- paste0(
+      '<span data-indent="1" style="padding-left:1ch">',htmltools::htmlEscape(sub("^\u00a0","",label)),'</span>')
+    else if(length(prefixes) && !is.na(prefixes[i]) && nzchar(prefixes[i]) && startsWith(label,prefixes[i]))
+      shown[[column]][i] <- paste0("<strong>",htmltools::htmlEscape(prefixes[i]),"</strong>",
+        htmltools::htmlEscape(substring(label,nchar(prefixes[i])+1)))
+  }
+  knitr::kable(shown,format="html",escape=FALSE,row.names=FALSE,...)
+}
+```
+
+# Read QTC Data
+
+```{r read-data}
+cq_files <- list.files(".", pattern = "[.]csv$")
+cq_files <- cq_files[!grepl("^(tbl_|html_tbl_|covariates[.]csv$|labels[.]csv$|endpoints[.]csv$|safety_endpoints[.]csv$|nca_initials[.]csv$|ladder_table[.]csv$)", cq_files)]
+if (nzchar(DATA_FILE)) {
+  if (!file.exists(DATA_FILE)) stop("CQTC_SCHEMA_NO_DATA DATA_FILE not found: ", DATA_FILE)
+  cq_file <- DATA_FILE
+} else if (length(cq_files) == 1) {
+  cq_file <- cq_files[1]
+} else if (length(cq_files) == 0) {
+  stop("CQTC_SCHEMA_NO_DATA no csv in ", getwd(),
+       " — put the study's QTc/PK export there, or set DATA_FILE")
+} else {
+  ok <- vapply(cq_files, function(f) {
+    h <- toupper(names(utils::read.csv(f, nrows = 0)))
+    any(h %in% c("PKCONC", "CONC", "CONCENTRATION", "PK_AVAL")) &&
+      any(h %in% c("CFBQTCF", "CFBQTC", "DELTAQTCF", "QTCFAG", "QTCF"))
+  }, logical(1))
+  if (sum(ok) == 1) cq_file <- cq_files[ok] else
+    stop("CQTC_SCHEMA_MULTI cannot tell which csv is the analysis dataset in ", getwd(),
+         " (found: ", paste(cq_files, collapse = ", "),
+         "); set DATA_FILE or pass --data <file>")
+}
+cq_note("CQTC_SCHEMA_DATA", cq_file, "\n")
+
+qtc_df <- tryCatch(as.data.frame(readr::read_csv(cq_file, na = c(".","","NA"))),
+                   error = function(e)
+                     utils::read.csv(cq_file, na.strings = c(".", "", "NA"),
+                                     check.names = FALSE))
+cq_note("CQTC_SCHEMA_DIM", nrow(qtc_df), "records,", ncol(qtc_df), "columns\n")
+
+.cq_alias <- function(cands, canon, required = FALSE) {
+  hit <- cands[cands %in% names(qtc_df)]
+  if (!length(hit)) {
+    if (required) stop("CQTC_SCHEMA_NO_CORE the table has none of ",
+                       paste(cands, collapse = " / "), " — it is not a c-QTc table")
+    return(invisible(FALSE))
+  }
+  if (hit[1] != canon) {
+    names(qtc_df)[names(qtc_df) == hit[1]] <<- canon
+    cq_note("CQTC_SCHEMA_ALIAS", hit[1], "->", canon, "\n")
+  }
+  invisible(TRUE)
+}
+.cq_alias(c("USUBJID", "SUBJID", "SUBJECT", "ID", "PATIENT"), "USUBJID", TRUE)
+.cq_alias(c("PKCONC", "CONC", "CONCENTRATION", "PK_AVAL"), "PKCONC", TRUE)
+if (length(QT_CHANGE_SOURCE) != 1L || !QT_CHANGE_SOURCE %in% c("auto", "supplied", "derived"))
+  stop("CQTC_QT_CHANGE_SOURCE must be auto, supplied or derived")
+.cq_alias(c("CFBQTCF", "CFBQTC", "DELTAQTCF", "DQTCF"), "CFBQTCF", QT_CHANGE_SOURCE == "supplied")
+.cq_alias(c("ATPT", "TPT", "TIMEPOINT", "TPTC"), "ATPT", TRUE)
+.cq_alias(c("BQTCF", "BQTC", "BASEQTCF", "QTCFBL"), "BQTCF")
+.cq_alias(c("ATPTN", "ATPTNUM", "TPTNUM"), "ATPTN")
+.cq_alias(c("AVISIT", "VISIT", "AVISITN"), "AVISIT")
+.cq_alias(c("ADY", "DY", "DAY"), "ADY")
+.cq_alias(c("PCTEST", "ANALYTE", "PARAM", "PARAMCD"), "PCTEST")
+.cq_alias(c("TRTA", "TRT", "TRT01A", "ARM", "TREAT", "TRTGRP"), "TRTA")
+.cq_alias(c("QTCFAG", "QTCF", "QTCFABS"), "QTCFAG")
+.cq_alias(c("CFBHR", "CFBHRATE", "DHR", "CFB_HR"), "CFBHR")
+.cq_alias(c("PKBLQ", "BLQ", "BLQFL", "LLOQFL"), "PKBLQ")
+.cq_alias(c("STUDYID", "STUDY", "PROTOCOL"), "STUDYID")
+.cq_alias(c("TSFD", "TSFDO", "TIMESINCEFIRSTDOSE", "HSFD"), "TSFD")
+.cq_alias(c("AETHNIC", "ETHNIC", "ETHNICITY"), "AETHNIC")
+.cq_alias(c("ECOGBL", "ECOGL", "ECOG", "ECOGPS"), "ECOGBL")
+.cq_alias(c("TUMTP", "TUMTYPE", "TUMORTYPE"), "TUMTP")
+.cq_alias(c("AGE", "AGEYR"), "AGE")
+.cq_alias(c("SEX", "SEX_C"), "SEX")
+.cq_alias(c("RACE", "RACE_C"), "RACE")
+
+for (cn in c("STUDYID", "TRTA", "TSFD", "QTCFAG", "CFBHR", "PKBLQ", "ADY", "AVISIT",
+             "ATPTN", "AGE", "SEX", "RACE", "AETHNIC", "ECOGBL", "TUMTP",
+             "BQTCF", "CFBQTCF", "PCTEST"))
+  if (!cn %in% names(qtc_df)) qtc_df[[cn]] <- NA
+
+HAVE_BQTCF  <- !all(is.na(qtc_df$BQTCF))
+HAVE_QTCFAG <- !all(is.na(qtc_df$QTCFAG))
+HAVE_CFBHR  <- !all(is.na(qtc_df$CFBHR))
+HAVE_TUMTP  <- !all(is.na(qtc_df$TUMTP))
+HAVE_TSFD   <- !all(is.na(qtc_df$TSFD))
+for (.h in c("BQTCF", "QTCFAG", "CFBHR", "TUMTP", "TSFD"))
+  if (!get(paste0("HAVE_", .h)))
+    cq_note("CQTC_SCHEMA_SKIP", .h, "is not in the table — its sections are omitted\n")
+
+if (any(!is.na(qtc_df$PCTEST))) {
+  .lv <- sort(table(as.character(qtc_df$PCTEST)), decreasing = TRUE)
+  cq_note("CQTC_SCHEMA_PCTEST",
+      paste(names(.lv), unname(.lv), sep = ":", collapse = " | "), "\n")
+  ANALYTE <- if (nzchar(ANALYTE_NAME)) {
+    if (!ANALYTE_NAME %in% names(.lv))
+      stop("CQTC_SCHEMA_ANALYTE '", ANALYTE_NAME, "' is not in PCTEST (found: ",
+           paste(names(.lv), collapse = ", "), ")")
+    ANALYTE_NAME
+  } else names(.lv)[1]
+  if (length(.lv) > 1)
+    cq_note("CQTC_SCHEMA_ANALYTE", ANALYTE,
+        "(most frequent of several; set ANALYTE_NAME to choose another)\n")
+  qtc_df <- qtc_df[as.character(qtc_df$PCTEST) %in% ANALYTE, , drop=FALSE]
+} else {
+  ANALYTE <- "the study analyte"
+  cq_note("CQTC_SCHEMA_NO_PCTEST every record is analysed\n")
+}
+CONC_LAB <- Sys.getenv("PMX_EXPOSURE_LABEL","")
+if(!nzchar(CONC_LAB)) CONC_LAB <- paste0(if(nzchar(DRUG)) DRUG else "drug"," concentration")
+CONC_UNIT <- trimws(CONC_UNIT)
+CONC_UNIT_KNOWN <- nzchar(CONC_UNIT)
+SLOPE_UNIT <- if(CONC_UNIT_KNOWN) paste0("ms per ",CONC_UNIT) else "ms per input concentration unit"
+if(CONC_UNIT_KNOWN && !grepl(CONC_UNIT,CONC_LAB,fixed=TRUE))
+  CONC_LAB <- paste0(CONC_LAB," (",CONC_UNIT,")")
+if(!CONC_UNIT_KNOWN) {
+  CONC_LAB <- paste0(CONC_LAB," (unit unspecified)")
+  cq_note("CQTC_UNIT_UNSPECIFIED provide CONC_UNIT for the numeric PKCONC values; the analyte name is not a unit. No conversion was performed.\n")
+}
+
+
+qtc_tox <- qtc_df
+
+test <- qtc_tox %>% group_by(USUBJID, ADY, ATPTN) %>%
+  summarise(n = n())
+
+stat_func <- function(df, var, stat) {
+
+  df %>%
+    distinct(USUBJID, .keep_all = TRUE) %>%
+    summarize(
+      stat = do.call(
+        stat,
+        list({{ var }}, na.rm = TRUE)
+      )
+    ) %>%
+    pull(stat) %>%
+    as.numeric()
+}
+
+dose_of <- function(x) {
+  x <- as.character(x)
+  out <- sub("^.*?([0-9]+\\.?[0-9]*[[:space:]]*(mg/kg|mg/m2|mg|µg/kg|ug/kg|µg|ug|g))\\b.*$",
+             "\\1", x)
+  out[!grepl("[0-9]", out)] <- x[!grepl("[0-9]", out)]
+  trimws(out)
+}
+regimen_of <- function(x) {
+  x <- as.character(x)
+  out <- sub("^.*[[:space:]]([^[:space:]]+)[[:space:]]*$", "\\1", x)
+  out[is.na(x) | !nzchar(out)] <- "single regimen"
+  out
+}
+cycle_of <- function(x) {
+  x <- as.character(x)
+  m <- regmatches(x, regexpr("CYCLE[[:space:]]*[0-9]+|C[0-9]+\\b", x, ignore.case = TRUE))
+  out <- toupper(trimws(substr(x, 1, 7)))
+  hit <- nzchar(m)
+  out[hit] <- toupper(m[hit])
+  out[is.na(x)] <- NA_character_
+  out
+}
+
+qt_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+qt_derived <- qt_numeric(qtc_df$QTCFAG) - qt_numeric(qtc_df$BQTCF)
+qt_supplied <- qt_numeric(qtc_df$CFBQTCF)
+qt_paired <- is.finite(qt_derived)
+if (QT_CHANGE_SOURCE == "auto")
+  QT_CHANGE_SOURCE <- if (any(qt_paired)) "derived" else "supplied"
+if (QT_CHANGE_SOURCE == "supplied" && !any(is.finite(qt_supplied)))
+  stop("CQTC_QT_CHANGE_SUPPLIED requires usable change-from-baseline QTcF values")
+cq_note("CQTC_QT_CHANGE_SOURCE ", QT_CHANGE_SOURCE, "\n")
+qt_disagreement <- qt_paired & is.finite(qt_supplied) & abs(qt_supplied - qt_derived) > 0.11
+qt_change_qc <- list(source=QT_CHANGE_SOURCE, paired_records=sum(qt_paired),
+                     discrepancies=sum(qt_disagreement), tolerance_ms=0.11)
+if (any(qt_disagreement))
+  cq_note("CQTC_QT_CHANGE_DISAGREEMENT ", sum(qt_disagreement), " paired records exceed 0.11 ms. Source: ", QT_CHANGE_SOURCE, ".\n")
+if (QT_CHANGE_SOURCE == "derived") {
+  if (!any(qt_paired)) stop("CQTC_QT_CHANGE_DERIVED requires paired QTcF and baseline values")
+  qtc_df$CFBQTCF <- ifelse(qt_paired, qt_derived, NA_real_)
+}
+qt_change_description <- paste0(
+  if (QT_CHANGE_SOURCE == "derived")
+    "Change from baseline was calculated from paired QTcF and baseline values in memory."
+  else "Change from baseline was taken from the supplied dataset.",
+  if (any(qt_disagreement))
+    paste0(" In ", sum(qt_disagreement), " paired records, the supplied and calculated changes differed by more than 0.11 ms.")
+  else "")
+
+qtc_df <- qtc_df %>%
+  mutate(DOSE = ifelse(is.na(TRTA), "All patients", dose_of(TRTA)),
+         REGIMEN = regimen_of(TRTA))
+cq_note("CQTC_SCHEMA_REGIMENS", paste(unique(qtc_df$DOSE), collapse = " | "), "\n")
+
+qtc_tox <- qtc_df
+
+if (!nzchar(STUDY_ID) && any(!is.na(qtc_tox$STUDYID)))
+  STUDY_ID <- as.character(stats::na.omit(qtc_tox$STUDYID))[1]
+if (!nzchar(STUDY_ID)) {
+  STUDY_ID <- "(study)"
+  cq_note("CQTC_SCHEMA_SKIP no STUDYID column — the report says '(study)'\n")
+}
+if (!nzchar(DRUG)) DRUG <- "drug"
+if (!nzchar(INDICATION)) { INDICATION <- "the study indication"
+  cq_note("CQTC_SCHEMA_SKIP no indication column — the report says 'the study indication'\n") }
+if (!nzchar(MATRIX)) MATRIX <- "the study matrix"
+if (!nzchar(LAB))    LAB    <- "the bioanalytical laboratory"
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+labels <- data.frame(
+  key   = c("STUDY", "PROJECT", "DRUG", "INDICATION", "ANALYTE", "MATRIX", "LAB",
+            "DATASET", "AUTHOR", "DATE"),
+  value = c(STUDY_ID, STUDY_ID, DRUG, INDICATION, ANALYTE, MATRIX, LAB,
+            cq_file, AUTHOR, format(Sys.Date())),
+  stringsAsFactors = FALSE)
+utils::write.csv(labels, file.path(OUT_DIR, "labels.csv"), row.names = FALSE)
+cq_note("CQTC_LABELS", paste(labels$key, labels$value, sep = "=", collapse = " "), "\n")
+
+ATPT_ORDER <- c("PREDOSE", "PRE", "POST15M", "POST30M", "POST1H", "POST2H", "POST3H",
+                "POST4H", "POST6H", "POST8H", "POST12H", "POST24H", "POST48H",
+                "POST72H", "POST168H")
+.cq_obs <- unique(as.character(qtc_tox$ATPT))
+if (any(!is.na(qtc_tox$ATPTN))) {
+  .cq_ord <- tapply(as.numeric(qtc_tox$ATPTN), as.character(qtc_tox$ATPT), min, na.rm = TRUE)
+  ATPT_LEVELS <- names(.cq_ord)[order(unlist(.cq_ord))]
+} else {
+  ATPT_LEVELS <- c(intersect(ATPT_ORDER, .cq_obs), setdiff(.cq_obs, ATPT_ORDER))
+}
+cq_note("CQTC_SCHEMA_ATPT", paste(ATPT_LEVELS, collapse = " | "), "\n")
+
+# One disposition cohort is used by screening, fitting and diagnostics.
+blq_flag <- function(x) {
+  value <- toupper(trimws(as.character(x)))
+  yes <- c("Y","YES","TRUE","T","1"); no <- c("N","NO","FALSE","F","0","")
+  bad <- !is.na(value) & !value %in% c(yes,no)
+  if(any(bad)) stop("Unrecognised PKBLQ coding; configure BLQ coding explicitly")
+  !is.na(value) & value %in% yes
+}
+d0 <- qtc_tox
+d1 <- d0[!blq_flag(d0$PKBLQ),,drop=FALSE]
+d2 <- d1[!is.na(d1$PKCONC),,drop=FALSE]
+d3 <- if(HAVE_BQTCF) d2[!is.na(d2$BQTCF),,drop=FALSE] else d2
+d4 <- d3[!is.na(d3$CFBQTCF),,drop=FALSE]
+qtc_tox2 <- d4 %>%
+  mutate(AGE = AGE - stat_func(d4, AGE, median),
+         ATPT = factor(as.character(ATPT),levels=ATPT_LEVELS), CYCLE=cycle_of(AVISIT))
+if(HAVE_BQTCF) qtc_tox2 <- qtc_tox2 %>% mutate(BQTCF=BQTCF-stat_func(d4,BQTCF,median))
+
+if (!HAVE_TSFD) {
+  if (!all(is.na(qtc_tox2$ADY))) {
+    qtc_tox2$TSFD <- as.numeric(qtc_tox2$ADY) * 24
+    HAVE_TSFD <- TRUE
+    cq_note("CQTC_SCHEMA_TSFD derived from ADY (hours)\n")
+  } else {
+    qtc_tox2$TSFD <- NA_real_
+    cq_note("CQTC_SCHEMA_SKIP no TSFD and no ADY — the hysteresis section is omitted\n")
+  }
+}
+HAVE_TUMTP <- HAVE_TUMTP && any(!is.na(qtc_tox2$TUMTP))
+```
+
+# Analysis Population
+
+**`r DRUG` — study `r STUDY_ID` (`r INDICATION`).**
+
+## Study and Dosing Regimens
+
+```{r study-regimens}
+study_tab <- qtc_tox %>%
+  group_by(STUDYID, DOSE, REGIMEN) %>%
+  summarise(Patients = length(unique(USUBJID)),
+            Records = dplyr::n(),
+            QTCF_REC = sum(!is.na(QTCFAG)),
+            PK_REC = sum(!is.na(PKCONC)),
+            .groups = "drop")
+study_tab <- as.data.frame(study_tab[, c("STUDYID", "DOSE", "REGIMEN", "Patients",
+                                         "Records", "QTCF_REC", "PK_REC")])
+names(study_tab) <- c("Study", "Dose regimen", "Interval", "Patients", "Records",
+                      "QTcF records", "PK records")
+kable(study_tab,
+      caption = "Study included in the concentration-QTcF analysis and dosing regimens",
+      align = "lccccc")
+```
+
+## Data Disposition
+
+```{r data-disposition}
+disposition <- data.frame(
+  Step = c("QTcF and PK records in the source dataset",
+           "  Removed: PK concentration below the LLOQ (BLQ)",
+           "  Removed: no time-matched PK concentration",
+           "  Removed: baseline QTcF missing (where available)",
+           "  Removed: change-from-baseline QTcF missing",
+           "Concentration-QTcF analysis dataset"),
+  Removed = c("", nrow(d0) - nrow(d1), nrow(d1) - nrow(d2),
+              nrow(d2) - nrow(d3), nrow(d3) - nrow(d4), ""),
+  Remaining = c(nrow(d0), nrow(d1), nrow(d2), nrow(d3), nrow(d4), nrow(d4)),
+  Patients = c(length(unique(d0$USUBJID)), length(unique(d1$USUBJID)),
+               length(unique(d2$USUBJID)), length(unique(d3$USUBJID)),
+               length(unique(d4$USUBJID)), length(unique(d4$USUBJID))),
+  check.names = FALSE, stringsAsFactors = FALSE)
+names(disposition) <- c("Data disposition step", "Records removed",
+                        "Records remaining", "Patients")
+
+kable(disposition,
+      caption = paste0("Data disposition for the concentration-QTcF analysis (",
+                       nrow(d4), " records from ", length(unique(d4$USUBJID)),
+                       " patients)"),
+      align = "lccc")
+```
+
+## Demographics by Study
+
+```{r demographics}
+support_paths <- c(file.path(Sys.getenv("PMX_WORD_REPORT",""),"ppk_report_support.R"),
+  file.path(".pmx","word-report","ppk_report_support.R"),
+  file.path(".pmx","pmx_workspace","word-report","ppk_report_support.R"),
+  file.path(Sys.getenv("PMX_TOOLKIT",""),"word-report","ppk_report_support.R"),
+  file.path("word-report","ppk_report_support.R"))
+support_paths <- support_paths[file.exists(support_paths)]
+if(!length(support_paths)) stop("Report support missing: use the complete workspace toolkit")
+source(support_paths[1])
+pt <- qtc_tox %>% filter(USUBJID %in% qtc_tox2$USUBJID)
+summary_vars <- intersect(cov_want,names(pt))
+summary_labels <- setNames(vapply(summary_vars,cov_display,""),summary_vars)
+demog <- pmx_patient_characteristics(pt,setdiff(summary_vars,cov_categorical),
+  intersect(summary_vars,cov_categorical),summary_labels,level_display=cat_level_display,id="USUBJID")
+cq_kable(demog,caption=paste0("Summary of demographic characteristics",if(isTRUE(attr(demog,"stratified_by_study"))) " by study" else "", " (analysis population)"),
+  align=paste0("l",strrep("c",ncol(demog)-1L)),table.attr='class="table baseline-characteristics"')
+cat("\n\nContinuous variables are presented as median [min, max], while categorical variables are presented as n (%) of patients with nonmissing values. Missing values are reported separately.\n\n")
+```
+
+<style>
+table th, table td {font-family: inherit; font-size: inherit; vertical-align: middle; word-break: normal; overflow-wrap: normal; hyphens: none;}
+table th {white-space: normal; line-height: 1.25;}
+.baseline-characteristics th:first-child, .baseline-characteristics td:first-child,
+.covariate-screen th:first-child, .covariate-screen td:first-child {text-align: left !important; white-space: pre-line;}
+.baseline-characteristics th:first-child {width: 40%;}
+.covariate-screen {font-size: .91em; width:100%;}
+.covariate-screen th:first-child {width: 45%;}
+.pmx-equation {font-weight: bold; text-align: center; margin: 0.8em 0;}
+.pmx-model-note {margin: 0 0 0.35em 1.5em;}
+</style>
+
+# 4. Results
+
+## 4.2. Concentration-QTcF Analysis
+
+### 4.2.1. Data Exploration
+
+#### Summary of Outliers
+
+```{r outliers, results='asis', fig.width=9, fig.height=4}
+outlier_tab <- qtc_tox2 %>%
+  summarize(
+    `QTcF >480 ms` = if(any(!is.na(QTCFAG))) sum(QTCFAG > 480, na.rm = TRUE) else NA_integer_,
+    `QTcF >500 ms` = if(any(!is.na(QTCFAG))) sum(QTCFAG > 500, na.rm = TRUE) else NA_integer_,
+    `ΔQTcF >60 ms` = sum(CFBQTCF > 60, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to = "Category",
+    values_to = "N"
+  )
+
+outlier_flag <- (!is.na(qtc_tox2$QTCFAG) & qtc_tox2$QTCFAG > 480) |
+                (!is.na(qtc_tox2$CFBQTCF) & qtc_tox2$CFBQTCF > 60)
+outlier_summary <- list(records=sum(outlier_flag),
+  subjects=length(unique(qtc_tox2$USUBJID[outlier_flag])),total_records=nrow(qtc_tox2),
+  excluded_for_threshold=0L,criteria=outlier_tab)
+outlier_summary$description <- "Observations exceeding an assessed QTcF or change-from-baseline threshold were retained; no records were excluded solely because a threshold was exceeded. Threshold categories may overlap."
+cat(outlier_summary$description,"\n\n")
+outlier_tab$N <- ifelse(is.na(outlier_tab$N),"Not assessed",as.character(outlier_tab$N))
+kable(outlier_tab,
+      caption = paste0("Summary of outliers (Total N=", nrow(qtc_tox2), ")"),
+      align = "c")
+```
+
+```{r plot-visit-summary-func, include=FALSE}
+plot_visit_summary <- function(data,
+                               value,
+                               ylab,
+                               group_var = NULL,
+                               facet_var = "CYCLE",
+                               hline0 = FALSE,
+                               dodge_width = 0.4,
+                               facet_nrow = NULL) {
+
+  value <- enquo(value)
+
+  grp1 <- c("USUBJID", "ATPT")
+  if (!is.null(group_var)) grp1 <- c(group_var, grp1)
+  if (!is.null(facet_var)) grp1 <- c(facet_var, grp1)
+
+  grp2 <- "ATPT"
+  if (!is.null(group_var)) grp2 <- c(group_var, grp2)
+  if (!is.null(facet_var)) grp2 <- c(facet_var, grp2)
+
+  plotdat <- data %>%
+    filter(
+      !is.na(ATPT),
+      !is.na(!!value),
+      toupper(as.character(AVISIT)) != "BASELINE"
+    ) %>%
+    group_by(across(all_of(grp1))) %>%
+    summarize(
+      VALUE = max(!!value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    group_by(across(all_of(grp2))) %>%
+    summarize(
+      N = sum(!is.na(VALUE)),
+      Mean = mean(VALUE, na.rm = TRUE),
+      SD = sd(VALUE, na.rm = TRUE),
+      SE = SD / sqrt(N),
+      .groups = "drop"
+    )
+
+  dodge <- position_dodge(width = dodge_width)
+
+  if (is.null(group_var)) {
+
+    p <- ggplot(
+      plotdat,
+      aes(
+        x = ATPT,
+        y = Mean
+      )
+    ) +
+      geom_point(size = 2) +
+      geom_errorbar(
+        aes(
+          ymin = Mean - SE,
+          ymax = Mean + SE
+        ),
+        width = 0.15
+      )
+
+  } else {
+
+    p <- ggplot(
+      plotdat,
+      aes(
+        x = ATPT,
+        y = Mean,
+        color = .data[[group_var]]
+      )
+    ) +
+      geom_point(
+        size = 2,
+        position = dodge
+      ) +
+      geom_errorbar(
+        aes(
+          ymin = Mean - SE,
+          ymax = Mean + SE
+        ),
+        width = 0.15,
+        position = dodge
+      )
+  }
+
+  if (hline0) {
+    p <- p +
+      geom_hline(
+        yintercept = 0,
+        linetype = 2
+      )
+  }
+
+  if (!is.null(facet_var)) {
+    p <- p +
+      facet_wrap(
+        as.formula(paste("~", facet_var)),
+        nrow = facet_nrow
+      )
+  }
+
+  p +
+    labs(
+      x = "",
+      y = ylab,
+      color = group_var
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      ),
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+#### Concentration vs Visit Plot
+
+```{r conc-vs-visit, fig.width=9, fig.height=4, fig.cap="Concentration by visit"}
+plot_visit_summary(data = qtc_tox2,
+                   value = PKCONC,
+                   group_var = NULL,
+                   ylab = CONC_LAB,
+                   facet_var = "CYCLE",
+                   hline0 = FALSE)
+```
+
+#### ΔQTcF vs Visit Plot
+
+```{r dqtcf-vs-visit, fig.width=9, fig.height=4, fig.cap="Change in QTcF by visit"}
+plot_visit_summary(data = qtc_tox2,
+                   value = CFBQTCF,
+                   group_var = NULL,
+                   ylab = expression(Delta*"QTcF (ms)"),
+                   facet_var = "CYCLE",
+                   hline0 = TRUE)
+```
+
+#### ΔQTcF vs Visit Plot (by Dose Group)
+
+```{r dqtcf-vs-visit-dose, fig.width=9, fig.height=4, fig.cap="Change in QTcF by dose group and visit"}
+plot_visit_summary(data = qtc_tox2,
+                   value = CFBQTCF,
+                   group_var = "DOSE",
+                   ylab = expression(Delta*"QTcF (ms)"),
+                   facet_var = "CYCLE",
+                   hline0 = TRUE,
+                   dodge_width = 0.6)
+```
+
+#### ΔQTcF vs Visit Plot (by Tumor Type)
+
+```{r dqtcf-vs-visit-tumtp, fig.width=9, fig.height=4, fig.cap="Change in QTcF by tumor type and visit"}
+if (HAVE_TUMTP) {
+  plot_visit_summary(data = qtc_tox2,
+                     value = CFBQTCF,
+                     group_var = "TUMTP",
+                     ylab = expression(Delta*"QTcF (ms)"),
+                     facet_var = "CYCLE",
+                     hline0 = TRUE)
+} else cq_note("CQTC_SCHEMA_SKIP the by-tumour-type plot (no TUMTP in the table)\n")
+```
+
+#### ΔHR vs Visit Plot
+
+```{r dhr-vs-visit, fig.width=9, fig.height=4, fig.cap="Change in heart rate by visit"}
+if (HAVE_CFBHR) {
+  plot_visit_summary(data = qtc_tox2,
+                     value = CFBHR,
+                     group_var = NULL,
+                     ylab = expression(Delta*"HR (bpm)"),
+                     facet_var = "CYCLE",
+                     hline0 = TRUE)
+} else cq_note("CQTC_SCHEMA_SKIP the HR section (no CFBHR in the table)\n")
+```
+
+#### Individual QTcF Time Profiles
+
+```{r indiv-qtcf, fig.width=10, fig.height=4.5, fig.cap="Individual QTcF time profiles"}
+profile_plot <- function(value, ylab) {
+  d <- qtc_tox2[!is.na(qtc_tox2[[value]]), ]
+  ggplot(d, aes(ATPT, .data[[value]],
+                group = interaction(USUBJID, AVISIT), colour = CYCLE)) +
+    geom_line(alpha = 0.30, linewidth = 0.3) +
+    stat_summary(aes(ATPT, .data[[value]], group = 1), fun = mean, geom = "line",
+                 colour = "black", linewidth = 0.8) +
+    facet_wrap(~ DOSE, nrow = 1) +
+    scale_colour_manual(values = rep(c("#1b6ca8", "#d1495b", "#2e8b57"),
+                                     length.out = max(1, length(unique(stats::na.omit(d$CYCLE)))))) +
+    labs(x = "", y = ylab, colour = "Cycle") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.minor = element_blank())
+}
+if (HAVE_QTCFAG) profile_plot("QTCFAG", "QTcF (ms)") else
+  cq_note("CQTC_SCHEMA_SKIP the absolute-QTcF profiles (no QTCFAG/QTCF in the table)\n")
+```
+
+#### Individual ΔQTcF Time Profiles
+
+```{r indiv-dqtcf, fig.width=10, fig.height=4.5, fig.cap="Individual change in QTcF over time"}
+profile_plot("CFBQTCF", expression(Delta*"QTcF (ms)")) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_hline(yintercept = 10, linetype = 3, colour = "grey40")
+```
+
+### 4.2.2. Base Model
+
+```{r base-model, results="asis"}
+lmer_fixest <- function(fit) {
+  # lm-aware: cq_fit() can fall back to fixed effects only (no random effects).
+  fe <- if (inherits(fit, "merMod")) lme4::fixef(fit) else stats::coef(fit)
+  se <- summary(fit)$coefficients[, "Std. Error"]
+  ci_lb <- fe - 1.96 * se
+  ci_ub <- fe + 1.96 * se
+
+  output <- data.frame(
+    EST = fe,
+    SE = se,
+    CI_LB = ci_lb,
+    CI_UB = ci_ub) %>%
+    mutate(BIC = round(BIC(fit), 1))
+  return(output)
+}
+
+lmer_rdmest <- function(fit) {
+  if (!inherits(fit, "merMod"))
+    return(data.frame(Parameters = "Residual", SD = round(summary(fit)$sigma, 3)))
+  data.frame(VarCorr(fit)) %>%
+    mutate(var1 = ifelse(var1 == "(Intercept)", "Intercept", var1)) %>%
+    mutate(var2 = ifelse(is.na(var2), "", var2)) %>%
+    mutate(Parameters = ifelse(grp == "Residual", grp, paste0(var1, "  ", var2))) %>%
+    mutate(SD = round(sdcor, 3)) %>%
+    dplyr::select(Parameters, SD)
+}
+
+cq_variables <- function(tab,vars,d,fit) {
+  terms <- rownames(tab)
+  labelled <- add_cat_labels(tab,vars,d,fit=fit)
+  vapply(seq_along(terms),function(i) {
+    term <- terms[i]
+    hit <- vars[vapply(vars,function(v) startsWith(term,v),TRUE)]
+    comparison <- if("Comparison (N)" %in% names(labelled)) labelled[["Comparison (N)"]][i] else NA_character_
+    if(length(hit) && !is.na(comparison) && nzchar(comparison)) {
+      v <- hit[which.max(nchar(hit))]
+      if(v %in% cov_categorical) return(paste0(cov_display(v),": ",comparison))
+      return(comparison)
+    }
+    if(term=="(Intercept)") "Intercept" else if(term=="PKCONC") CONC_LAB else term
+  },"")
+}
+cq_parameter_table <- function(fit,vars=character(),d=model.frame(fit)) {
+  fe <- if(inherits(fit,"merMod")) lme4::fixef(fit) else stats::coef(fit)
+  se <- summary(fit)$coefficients[,"Std. Error"]
+  fmt <- function(x) ifelse(is.finite(x),formatC(x,digits=4,format="g"),"NE")
+  fixed <- data.frame(term=names(fe),row.names=names(fe))
+  out <- data.frame(Parameter=cq_variables(fixed,vars,d,fit),Component="Fixed effect",
+    Estimate=fmt(fe),SE=fmt(se),`95% CI`=paste(fmt(fe-1.96*se),fmt(fe+1.96*se),sep=" to "),
+    check.names=FALSE,row.names=NULL)
+  if(inherits(fit,"merMod")) {
+    vc <- as.data.frame(lme4::VarCorr(fit))
+    correlation <- !is.na(vc$var2)
+    parameter <- ifelse(vc$grp=="Residual","Residual",
+      paste0(vc$grp,": ",vc$var1,ifelse(correlation,paste0(" / ",vc$var2),"")))
+    component <- ifelse(vc$grp=="Residual","Residual SD",
+      ifelse(correlation,"Random-effect correlation","Random-effect SD"))
+    random <- data.frame(Parameter=parameter,Component=component,Estimate=fmt(vc$sdcor),
+      SE="—",`95% CI`="—",check.names=FALSE)
+  } else random <- data.frame(Parameter="Residual",Component="Residual SD",
+    Estimate=fmt(summary(fit)$sigma),SE="—",`95% CI`="—",check.names=FALSE)
+  out <- rbind(out,random)
+  out$BIC <- "";out$BIC[1] <- formatC(BIC(fit),digits=1,format="f")
+  out
+}
+
+# Base-model random-effects structure
+BASE_COV <- intersect(mandatory_cov,names(qtc_tox2))
+BASE_COV <- BASE_COV[vapply(BASE_COV,function(v) length(unique(na.omit(qtc_tox2[[v]])))>1L,TRUE)]
+cq_screen_rhs <- paste(c("PKCONC", BASE_COV), collapse = " + ")
+cq_re_choice <- cq_choose_re(cq_screen_rhs, qtc_tox2)
+BASE_RE <- cq_re_choice$re
+cq_note("CQTC_RE_STRUCTURE ", BASE_RE, " (chosen on ", cq_screen_rhs, ")\n")
+base_fit <- cq_re_choice$fit
+if(!fit_valid(base_fit)) stop("CQTC_BASE_FIT_UNUSABLE: no estimable prespecified base model")
+attr(base_fit,"re_struct") <- BASE_RE
+
+base_tab <- function(expr, cap) tryCatch(kable(expr, caption = cap, row.names=FALSE, align = "c"),
+  error = function(e) { cq_note("CQTC_BASE_FIT_TABLE_UNAVAILABLE ", conditionMessage(e), "\n");
+                        knitr::asis_output("_Not available for this dataset._") })
+base_tab(cq_parameter_table(base_fit), "Base model parameter estimates")
+cat("\nSE and 95% CI are provided for fixed effects. Random-effect and residual SD/correlation uncertainty was not computed; — does not mean zero. SD is not SE.\n")
+```
+
+### 4.2.3. Full Model
+
+#### Covariate Analysis
+
+```{r covariate-analysis, results="asis"}
+cov_var <- cov_want[vapply(cov_want, function(x)
+  x %in% names(qtc_tox2) && sum(!is.na(qtc_tox2[[x]])) >= 3 &&
+    length(unique(stats::na.omit(qtc_tox2[[x]]))) >= 2, logical(1))]
+cov_var <- setdiff(cov_var,mandatory_cov)
+if (length(setdiff(setdiff(cov_want,mandatory_cov), cov_var)))
+  cq_note("CQTC_SCHEMA_COV_DROP", paste(setdiff(setdiff(cov_want,mandatory_cov), cov_var), collapse = ", "), "\n")
+cq_note("CQTC_SCHEMA_COV", paste(cov_var, collapse = " | "), "\n")
+if(!length(cov_var)) cq_note("CQTC_NO_OPTIONAL_COVARIATES: full model equals the prespecified base model\n")
+
+set_ref <- set_cat_ref(qtc_tox2, cov_var)
+qtc_tox2 <- set_ref$data
+if (length(set_ref$releveled))
+  cq_note("CQTC_SCHEMA_REF_RELEVEL ",
+          paste(sprintf("%s (was '%s')", names(set_ref$releveled), set_ref$releveled),
+                collapse = " | "), "\n")
+
+univ_model <- list(); univ_result <- list(); retained <- character(); failed_covariates <- character()
+for(v in cov_var) {
+  vars <- unique(c("CFBQTCF", "PKCONC", "USUBJID", BASE_COV, v))
+  same <- qtc_tox2[complete.cases(qtc_tox2[,vars,drop=FALSE]),,drop=FALSE]
+  same <- set_cat_ref(same,intersect(cov_categorical,v))$data
+  pair_base <- tryCatch(cq_fit(cq_screen_rhs,same,re=BASE_RE),error=function(e) {cq_note("CQTC_CANDIDATE_UNUSABLE ",v,": ",conditionMessage(e),"\n");NULL})
+  pair_full <- if(is.null(pair_base)) NULL else tryCatch(cq_fit(paste(c(cq_screen_rhs,v),collapse=" + "),same,re=attr(pair_base,"re_struct")),
+    error=function(e) {cq_note("CQTC_CANDIDATE_UNUSABLE ",v,": ",conditionMessage(e),"\n");NULL})
+  if(!is.null(pair_full) && !identical(attr(pair_base,"re_struct"),attr(pair_full,"re_struct"))) {
+    re <- attr(pair_full,"re_struct")
+    pair_base <- cq_fit_at(re,cq_screen_rhs,same)
+    if(!is.null(pair_base)) attr(pair_base,"re_struct") <- re
+  }
+  if(!fit_valid(pair_full) || !fit_valid(pair_base)) {failed_covariates <- union(failed_covariates,v);cq_note("CQTC_CANDIDATE_UNUSABLE ",v,"\n"); next}
+  if(nobs(pair_base)!=nobs(pair_full)) {failed_covariates <- union(failed_covariates,v);cq_note("CQTC_CANDIDATE_SAMPLE_MISMATCH ",v,"\n"); next}
+  tab <- lmer_fixest(pair_full); extra <- setdiff(rownames(tab),rownames(lmer_fixest(pair_base)))
+  tab <- tab[extra,,drop=FALSE]; if(!nrow(tab)) {failed_covariates <- union(failed_covariates,v);next}
+  delta <- BIC(pair_full)-BIC(pair_base)
+  tab$DELTA <- round(delta,1); tab$sig <- if(delta<0) "Yes" else "No"
+  tab$Covariate <- v; tab$N_records <- nrow(model.frame(pair_full)); tab$N_subjects <- length(unique(same$USUBJID))
+  tab <- add_cat_labels(tab,v,same,fit=pair_full)
+  tab$Variables <- cq_variables(tab,v,same,pair_full)
+  univ_result[[v]] <- tab; univ_model[[v]] <- pair_full
+  if(delta<0) retained <- c(retained,v)
+}
+if(length(univ_result)) {
+  univ_output <- bind_rows(univ_result) %>% arrange(desc(sig=="Yes"),DELTA,BIC,Covariate)
+} else univ_output <- data.frame(Covariate=character(),DELTA=numeric(),sig=character())
+
+rows <- list(); prefixes <- character()
+display_vars <- unique(univ_output$Covariate)
+display_vars <- c(setdiff(display_vars,cov_categorical),intersect(display_vars,cov_categorical))
+for(v in display_vars) {
+  group <- univ_output[univ_output$Covariate==v,,drop=FALSE]
+  label <- cov_display(v); categorical <- v %in% cov_categorical
+  if(categorical) {
+    rows[[length(rows)+1L]] <- data.frame(Covariate=label,Estimate="",`95% CI`="",
+      BIC=formatC(group$BIC[1],digits=1,format="f"),`Delta BIC`=formatC(group$DELTA[1],digits=1,format="f"),
+      Retained=group$sig[1],check.names=FALSE)
+    prefixes <- c(prefixes,label)
+  }
+  for(i in seq_len(nrow(group))) {
+    comparison <- sub("\\s*\\(N\\s*=.*\\)\\s*$","",group[["Comparison (N)"]][i],perl=TRUE)
+    rows[[length(rows)+1L]] <- data.frame(Covariate=if(categorical) paste0("\u00a0",comparison) else label,
+      Estimate=cq_format_coef(group$EST[i]),`95% CI`=paste(cq_format_coef(group$CI_LB[i]),cq_format_coef(group$CI_UB[i]),sep=" to "),
+      BIC=if(categorical) "" else formatC(group$BIC[i],digits=1,format="f"),
+      `Delta BIC`=if(categorical) "" else formatC(group$DELTA[i],digits=1,format="f"),
+      Retained=if(categorical) "" else group$sig[i],check.names=FALSE)
+    prefixes <- c(prefixes,if(categorical) "" else label)
+  }
+}
+univ_display <- if(length(rows)) do.call(rbind,rows) else data.frame(Covariate=character(),Estimate=character(),`95% CI`=character(),BIC=character(),`Delta BIC`=character(),Retained=character(),check.names=FALSE)
+attr(univ_display,"bold_labels") <- prefixes
+cq_kable(univ_display,caption="Covariate analysis",
+      align=paste0("l",strrep("c",ncol(univ_display)-1)),table.attr='class="table covariate-screen"')
+if(length(failed_covariates)) cat("\n\nCovariate assessment was incomplete: ",paste(failed_covariates,collapse=", ")," could not be evaluated; failure is not evidence of no effect.\n\n",sep="")
+```
+
+#### Full Model Parameter Estimates
+
+```{r full-model}
+FULL_COV <- unique(c(BASE_COV,retained))
+FULL_COV <- unique(c(BASE_COV,setdiff(FULL_COV,BASE_COV)[vapply(setdiff(FULL_COV,BASE_COV),
+  function(v) length(unique(na.omit(qtc_tox2[[v]])))>1L,TRUE)]))
+if(!length(FULL_COV)) FULL_COV <- NULL
+FULL_LAB <- if (is.null(FULL_COV)) {
+  "CFBQTCF ~ PKCONC (no estimable baseline adjustment or optional covariate)"
+} else {
+  paste("CFBQTCF ~ PKCONC +",paste(FULL_COV,collapse=" + "))
+}
+full_vars <- unique(c("CFBQTCF","PKCONC","USUBJID",FULL_COV))
+full_data <- qtc_tox2[complete.cases(qtc_tox2[,full_vars,drop=FALSE]),,drop=FALSE]
+full_data <- set_cat_ref(full_data,intersect(FULL_COV,cov_categorical))$data
+base_comparison_fit <- if(identical(rownames(model.frame(base_fit)),rownames(full_data))) base_fit else
+  cq_fit(cq_screen_rhs, full_data, re = BASE_RE)
+full_re <- attr(base_comparison_fit, "re_struct")
+full_fit <- if (!length(retained)) base_comparison_fit else
+  cq_fit(paste(c("PKCONC", FULL_COV), collapse = " + "), full_data, re = full_re)
+if(!is.null(full_fit) && !identical(attr(base_comparison_fit,"re_struct"),attr(full_fit,"re_struct"))) {
+  re <- attr(full_fit,"re_struct")
+  base_comparison_fit <- cq_fit_at(re,cq_screen_rhs,full_data)
+  if(!fit_valid(base_comparison_fit)) stop("CQTC_BASE_COMPARISON_UNUSABLE: cannot compare full and base with the same random-effects structure")
+  attr(base_comparison_fit,"re_struct") <- re
+}
+
+kable(cq_parameter_table(full_fit,unique(c(cov_var,FULL_COV)),full_data),
+      caption="Full model parameter estimates",row.names=FALSE,align="c")
+check_cat_ref(full_data,unique(c(cov_var,FULL_COV)),fit=full_fit)
+```
+
+### 4.2.4. Diagnostics
+
+```{r final-model, fig.width=8.5, fig.height=4, fig.cap="Observed versus population and individual predictions of change in QTcF"}
+final_fit <- full_fit
+if(!fit_valid(final_fit)) stop("CQTC_FINAL_FIT_UNUSABLE: cannot report an unclean final fit or change structure after comparison tables")
+qtc_tox2 <- full_data
+
+qtc_predict <- function(fit,newdata=NULL,individual=FALSE) {
+  d <- if(is.null(newdata)) model.frame(fit) else newdata
+  if (inherits(fit, "merMod")) {
+    fixed <- lme4::nobars(formula(fit)); tt <- delete.response(terms(fixed))
+    mm <- model.matrix(tt,data=d,contrasts.arg=attr(lme4::getME(fit,"X"),"contrasts"))
+    beta <- lme4::fixef(fit); mm <- mm[,names(beta),drop=FALSE]
+    mu <- if(individual) predict(fit,newdata=d,re.form=NULL) else as.numeric(mm %*% beta)
+  } else {
+    fixed <- formula(fit); tt <- delete.response(terms(fixed))
+    beta <- stats::coef(fit)
+    mm <- model.matrix(tt,data=d); mm <- mm[,names(beta),drop=FALSE]
+    mu <- as.numeric(mm %*% beta)
+  }
+  data.frame(fit=mu,se.fit=sqrt(pmax(0,rowSums((mm %*% as.matrix(vcov(fit)))*mm))))
+}
+final_pred <- qtc_predict(final_fit) %>%
+  cbind(qtc_tox2)
+
+final_ipred <- qtc_predict(final_fit,individual=TRUE) %>%
+  cbind(qtc_tox2)
+
+pred_plot <- ggplot(final_pred, aes(fit, CFBQTCF)) +
+  geom_point(shape = 1, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  geom_smooth(method = "loess", span = 0.95) +
+  labs(x = expression("Population predicted "*Delta*"QTcF (ms)"),
+       y = expression("Observed "*Delta*"QTcF (ms)"))
+
+ipred_plot <- ggplot(final_ipred, aes(fit, CFBQTCF)) +
+  geom_point(shape = 1, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  geom_smooth(method = "loess", span = 0.95) +
+  labs(x = expression("Individual predicted "*Delta*"QTcF (ms)"),
+       y = expression("Observed "*Delta*"QTcF (ms)"))
+
+grid.arrange(pred_plot, ipred_plot, nrow = 1)
+```
+
+### 4.2.5. Simulations
+
+#### Simulation vs Observation
+
+```{r sim-vs-obs, fig.width=7, fig.height=5, fig.cap="Model-predicted and observed change in QTcF versus concentration"}
+qtc_reference_frame <- function(grid) {
+  for(v in FULL_COV) {
+    x <- full_data[[v]]
+    if(is.factor(x)) grid[[v]] <- factor(rep(levels(x)[1],nrow(grid)),levels=levels(x))
+    else grid[[v]] <- median(x,na.rm=TRUE)
+  }
+  grid
+}
+sim_data <- data.frame(PKCONC = seq(min(qtc_tox2$PKCONC), max(qtc_tox2$PKCONC), length.out=101L)) %>%
+  mutate(BQTCF = 0)
+sim_data <- qtc_reference_frame(sim_data)
+sim_pred <- qtc_predict(final_fit,sim_data) %>%
+  as.data.frame() %>%
+  cbind(sim_data) %>%
+  mutate(fit_lb = fit - 1.96 * se.fit,
+         fit_ub = fit + 1.96 * se.fit)
+prediction_range <- list(
+  confidence_level=0.95,
+  reference_ms=10,
+  observed_concentration_range=range(sim_pred$PKCONC),
+  endpoints=sim_pred[c(1L,nrow(sim_pred)),c("PKCONC","fit","fit_lb","fit_ub")],
+  max_mean_ms=max(sim_pred$fit),
+  max_upper_ms=max(sim_pred$fit_ub)
+)
+
+ggplot() +
+  geom_point(data = qtc_tox2, aes(x = PKCONC, y = CFBQTCF), color = "blue", shape = 1) +
+  geom_line(data = sim_pred, aes(x = PKCONC, y = fit)) +
+  geom_ribbon(data = sim_pred, aes(x = PKCONC, ymin = fit_lb, ymax = fit_ub), alpha = 0.2, fill = "blue") +
+  geom_hline(yintercept = 10, linetype = 2) +
+  scale_y_continuous(breaks = seq(-30, 20, by = 10)) +
+  labs(x = CONC_LAB,
+       y = expression(Delta*"QTcF (ms)"))
+```
+
+#### ΔQTcF versus Concentration — Binned Means
+
+```{r conc-qtc-bins, fig.width=7, fig.height=5, fig.cap="Change in QTcF versus concentration by concentration bin"}
+qtc_bins <- qtc_tox2 %>%
+  filter(!is.na(PKCONC), !is.na(CFBQTCF)) %>%
+  mutate(BIN = dplyr::ntile(PKCONC, 10)) %>%
+  group_by(BIN) %>%
+  summarise(CONC = mean(PKCONC), N = dplyr::n(),
+            MEAN = mean(CFBQTCF), SE = sd(CFBQTCF) / sqrt(dplyr::n()),
+            .groups = "drop") %>%
+  mutate(LB = MEAN - 1.645 * SE, UB = MEAN + 1.645 * SE)   # 90% CI
+
+bins_grid <- data.frame(PKCONC = seq(min(qtc_bins$CONC), max(qtc_bins$CONC),
+                                     length.out = 100), BQTCF = 0)
+bins_grid <- qtc_reference_frame(bins_grid)
+bins_line <- qtc_predict(final_fit,bins_grid)
+bins_grid$FIT <- bins_line$fit
+bins_grid$LB  <- bins_line$fit - 1.645 * bins_line$se.fit
+bins_grid$UB  <- bins_line$fit + 1.645 * bins_line$se.fit
+
+ggplot() +
+  geom_ribbon(data = bins_grid, aes(PKCONC, ymin = LB, ymax = UB),
+              alpha = 0.2, fill = "blue") +
+  geom_line(data = bins_grid, aes(PKCONC, FIT), linewidth = 0.8) +
+  geom_errorbar(data = qtc_bins, aes(CONC, ymin = LB, ymax = UB), width = 0.2) +
+  geom_point(data = qtc_bins, aes(CONC, MEAN), size = 2.5) +
+  geom_text(data = qtc_bins, aes(CONC, MEAN, label = paste0("n=", N)),
+            vjust = -1.1, size = 3) +
+  geom_hline(yintercept = 10, linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 3, colour = "grey40") +
+  labs(x = CONC_LAB,
+       y = expression("Mean "*Delta*"QTcF (ms) with 90% CI"))
+```
+
+#### Hysteresis of ΔQTcF versus Concentration
+
+```{r hysteresis, fig.width=10, fig.height=if(HYSTERESIS_VIEW=="individual") 8 else 4.5, fig.cap="Hysteresis of change in QTcF versus concentration"}
+hyst <- qtc_tox2 %>%
+  filter(!is.na(TSFD),TSFD <= 21*24,!is.na(PKCONC),!is.na(CFBQTCF)) %>%
+  arrange(USUBJID,TSFD) %>% group_by(USUBJID) %>%
+  filter(n_distinct(TSFD)>1) %>% ungroup()
+hysteresis_shown <- nrow(hyst)>0
+if(!HYSTERESIS_VIEW %in% c("individual","overview")) stop("HYSTERESIS_VIEW must be individual or overview")
+if(length(HYSTERESIS_PANELS)!=1 || !is.finite(HYSTERESIS_PANELS) || HYSTERESIS_PANELS!=floor(HYSTERESIS_PANELS) || HYSTERESIS_PANELS<1 || HYSTERESIS_PANELS>12)
+  stop("HYSTERESIS_PANELS must be an integer from 1 to 12")
+HYSTERESIS_PANELS <- as.integer(HYSTERESIS_PANELS)
+if(hysteresis_shown) {
+  ids <- unique(as.character(hyst$USUBJID))
+  groups <- if(HYSTERESIS_VIEW=="overview") list(ids) else split(ids,ceiling(seq_along(ids)/HYSTERESIS_PANELS))
+  for(ids_here in groups) {
+    shown <- hyst[hyst$USUBJID %in% ids_here,,drop=FALSE]
+    shown$Patient <- paste0(shown$USUBJID,"; ",shown$DOSE)
+    p <- ggplot(shown,aes(PKCONC,CFBQTCF,group=USUBJID,colour=TSFD)) +
+      geom_path(alpha=0.7,linewidth=0.35,arrow=grid::arrow(length=grid::unit(.06,"inches"),type="closed")) +
+      geom_point(size=.8,alpha=.7) + scale_colour_viridis_c(name="Hours since\nfirst dose") +
+      geom_hline(yintercept=0,linetype=3,colour="grey40") + geom_hline(yintercept=10,linetype=2) +
+      labs(x=CONC_LAB,y=expression(Delta*"QTcF (ms)"),
+           caption="Arrows indicate increasing time; these exploratory trajectories do not establish the absence of hysteresis.") +
+      theme_bw(base_size=12) + theme(panel.grid.minor=element_blank())
+    if(HYSTERESIS_VIEW=="individual") p <- p + facet_wrap(~Patient,ncol=3,labeller=label_wrap_gen(width=25))
+    else p <- p + facet_wrap(~DOSE,nrow=1)
+    print(p)
+  }
+} else cq_note("CQTC_SCHEMA_SKIP hysteresis: no patient has usable records at multiple times\n")
+
+```
+
+#### Goodness of Fit and Model Statistics
+
+```{r model-stats, results="asis"}
+slope_row <- function(fit, label) {
+  fe <- if (inherits(fit, "merMod")) lme4::fixef(fit) else stats::coef(fit)
+  se <- summary(fit)$coefficients[, "Std. Error"]
+  sl <- fe[["PKCONC"]]; slse <- se[["PKCONC"]]
+  data.frame(
+    Model = label,
+    Intercept = sprintf("%.3f (%.3f)", fe[["(Intercept)"]], se[["(Intercept)"]]),
+    Slope = sprintf("%.4f (%.4f)", sl, slse),
+    CI90 = sprintf("%.4f to %.4f", sl - 1.645 * slse, sl + 1.645 * slse),
+    pval = format.pval(2 * pnorm(-abs(sl / slse)), digits = 3, eps = 1e-4),
+    BIC = sprintf("%.1f", BIC(fit)),
+    check.names = FALSE, stringsAsFactors = FALSE)
+}
+model_stats <- rbind(slope_row(base_comparison_fit, "Base model"),
+                     slope_row(full_fit, "Full model"))
+names(model_stats) <- c("Model", "Intercept (SE)", "Slope (SE)", "Slope 90% CI",
+                        "p (slope, Wald z)", "BIC")
+kable(model_stats, align = "lccccc",
+      caption = "Concentration-QTcF relationship and goodness of fit")
+cat(paste0("\nSlope and its uncertainty are expressed in ",SLOPE_UNIT,".\n"))
+```
+
+
+```{r report-result-contract, include=FALSE}
+dir.create(OUT_DIR,showWarnings=FALSE)
+co <- summary(final_fit)$coefficients
+report_sections <- list(
+  Introduction="This report evaluates the relationship between observed study-treatment concentrations and change from baseline in QTcF. The objectives are to describe the available data, estimate the concentration-QTcF association, assess covariates and model diagnostics, and characterise uncertainty in model-based predictions.",
+  DataSources="The study populations and dosing regimens represented in the supplied dataset are summarised below.",
+  DatasetCreation=paste0("The supplied analysis-ready file ",basename(cq_file)," provides concentration and ECG measurements paired within records. Pairing and baseline definitions were taken from the source dataset.",if(nzchar(PAIRING_METHOD)) paste0(" Pairing method: ",PAIRING_METHOD,".") else ""),
+  ConcentrationUnits=paste0("Concentrations are analysed on the scale supplied in the input, without unit conversion. The concentration display is ",CONC_LAB,".",if(CONC_UNIT_KNOWN) paste0(" The supplied unit is ",CONC_UNIT,"; the slope unit is ",SLOPE_UNIT,".") else " No concentration unit was supplied; slopes are expressed per input concentration unit. The analyte name does not identify a unit."),
+  ECGEndpoint=paste0("QTcF denotes the QT interval corrected for heart rate using Fridericia's formula, QTcF = QT / RR^(1/3), with QT in milliseconds and RR in seconds. Change from baseline is the postbaseline QTcF value minus the baseline QTcF value. ",qt_change_description,if(nzchar(BASELINE_DEFINITION)) paste0(" Baseline definition: ",BASELINE_DEFINITION,".") else ""),
+  MissingData="No missing concentration, endpoint or covariate values are imputed. Disposition exclusions and model-specific complete-case selection are kept separate; each model uses records complete for its actual variables.",
+  MissingPK="Records flagged as below the quantification limit or lacking an observed paired concentration are excluded from the concentration-QTcF analysis. Quantification-limit status is taken from the supplied BLQ flags; flagged values are not imputed.",
+  MissingQTc=paste0("Records lacking change-from-baseline QTcF are excluded.",if(HAVE_BQTCF) " Records missing baseline QTcF are also excluded when baseline values are available in the input." else " Baseline-QTcF adjustment is not performed when no baseline values are supplied."),
+  Methods="Exploratory displays describe QTcF, change from baseline and concentration over the available sampling occasions. Concentration-QTcF models account for repeated observations using the supported random-effects structure, with a fixed-effects-only fallback when necessary. Mixed-effects models are fitted by maximum likelihood. Baseline QTcF is a prespecified base-model adjustment when available and estimable; it is not selected or removed by BIC. Optional covariates are compared against that base model on matching complete-case records and the same random-effects structure. Parameter tables give Wald 95% intervals for fixed effects; slope summaries and binned-mean displays identify their 90% intervals separately.",
+  Software=paste0("Analyses and graphics were produced with R ",getRversion(),". Model fitting used lme4 ",packageVersion("lme4")," or stats::lm; plotting used ggplot2."),
+  DataDescription="Patient characteristics and analysis disposition are summarized in the corresponding tables. Individual models may use fewer records because of missing covariate values.",
+  DataExploration=paste0("Time profiles and visit summaries describe the observed concentration and ECG patterns. Concentration-bin displays show observed means and their intervals alongside the fitted population relationship.",if(hysteresis_shown) " Hysteresis trajectories are available in the accompanying HTML report; presence or absence of delay requires review of those plots." else ""),
+  BaseModel=paste0("The base model relates change from baseline in QTcF to concentration. ",
+    if(length(BASE_COV)) paste0(paste(cov_display(BASE_COV),collapse=", ")," is included as a prespecified adjustment, independently of BIC.") else "No estimable prespecified baseline adjustment was available.",
+    " The parameter table combines fixed effects, random-effect SDs/correlations and residual SD, with BIC shown once. Random-effect uncertainty was not computed; SD is not SE."),
+  FullModel=paste0("Optional covariates are screened as additions to the prespecified base model on matching records. ",
+    if(length(retained)) "Covariates that individually lower BIC on matching records are added to the full model." else if(length(failed_covariates)) "No optional covariate was retained among the evaluable comparisons; failed candidates leave the assessment incomplete." else "No optional covariate lowered BIC; the full model has the same covariate structure as the base model.",
+    if(length(failed_covariates)) paste0(" Not evaluable: ",paste(failed_covariates,collapse=", "),".") else "",
+    " Continuous variables are listed before categorical variables. Category coefficients use the actual fitted reference group; BIC, Delta BIC and retention are reported once per variable."),
+  Diagnostics="Observed versus population and individual predictions support assessment of the fitted relationship; the concentration-QTcF relationship and goodness-of-fit statistics table is retained in the HTML report. These displays do not by themselves establish external predictive performance or clinical relevance.",
+  Simulations="The displayed curves are model-based population predictions over the observed concentration range, with continuous covariates at their reference medians and categorical covariates at fitted reference levels. The main prediction ribbon is a 95% confidence interval for the mean response, not an individual prediction interval or a stochastic simulation. A horizontal reference line is an aid to interpretation; threshold conclusions require the appropriate predicted QTcF change and its uncertainty at the exposure of interest.")
+saveRDS(list(schema=1L,family="cqtc",data_md5=unname(tools::md5sum(cq_file)),
+  models=list(qtc=list(endpoint="QTcF change from baseline",kind="slope",exposure="PKCONC",
+    estimates=data.frame(term=rownames(co),estimate=co[,1],se=co[,"Std. Error"],stringsAsFactors=FALSE),
+    n=nrow(model.frame(final_fit)),n_subjects=length(unique(full_data$USUBJID)),
+    assessment=if(length(failed_covariates)) "partial" else "complete",failed_covariates=failed_covariates,
+    retained=retained,prespecified=BASE_COV,base_formula=paste(deparse(formula(base_comparison_fit)),collapse=" "),
+    base_bic=as.numeric(BIC(base_comparison_fit)),bic=as.numeric(BIC(full_fit)),
+    delta_bic=as.numeric(BIC(full_fit)-BIC(base_comparison_fit)),formula=paste(deparse(formula(final_fit)),collapse=" "))),
+  exposure_label=CONC_LAB,exposure_unit=if(CONC_UNIT_KNOWN) CONC_UNIT else NULL,
+  unit_status=if(CONC_UNIT_KNOWN) "specified" else "unspecified",slope_unit=SLOPE_UNIT,scale="raw",
+  random_estimates=if(inherits(final_fit,"merMod")) as.data.frame(lme4::VarCorr(final_fit)) else
+    data.frame(grp="Residual",var1=NA_character_,var2=NA_character_,vcov=summary(final_fit)$sigma^2,sdcor=summary(final_fit)$sigma),
+  uncertainty=list(fixed_effect_ci="Wald 95%",slope_summary_ci="Wald 90%",random_effect_se_ci="not_computed"),
+  qt_change_qc=qt_change_qc,prediction_range=prediction_range,
+  hysteresis=list(shown=hysteresis_shown,view=HYSTERESIS_VIEW,window_hours=21*24,review_state="not_reviewed"),
+  covariates=list(labels=cov_label,levels=cov_levels),
+  report_sections=report_sections,outliers=outlier_summary,full_equals_final=identical(full_fit,final_fit)),
+  file.path(OUT_DIR,"report_results.rds"))
+```
+
+
+```{r cqtc-study-narrative, include=FALSE}
+# Use exactly the same current-result and evidence gate as Word.
+cq_narrative_helpers <- c(
+  file.path(Sys.getenv("PMX_WORD_REPORT", ""), "result_narrative.R"),
+  file.path(".pmx", "word-report", "result_narrative.R"),
+  file.path(".pmx", "pmx_workspace", "word-report", "result_narrative.R"),
+  file.path("word-report", "result_narrative.R"))
+cq_narrative_helper <- cq_narrative_helpers[file.exists(cq_narrative_helpers)][1]
+if (is.na(cq_narrative_helper))
+  stop("Cannot locate the shared narrative helper; use analyses_template/tools/run_cqtc.sh to stage the report toolkit")
+source(cq_narrative_helper)
+cq_study_narrative <- pmx_narrative_sections(".", "cqtc", cq_file)
+```
+
+# 5. Discussion
+
+```{r cqtc-discussion, results='asis'}
+for (p in cq_study_narrative$Discussion) cat(p, "\n\n")
+```
+
+# 6. Conclusion
+
+```{r cqtc-conclusion, results='asis'}
+for (p in cq_study_narrative$Conclusion) cat(p, "\n\n")
+```

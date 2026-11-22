@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" font-family="Arial, Helvetica, sans-serif" data-family="pkpd">
+  <rect x="0" y="0" width="1600" height="820" fill="#ffffff"/>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#222222"/>
+    </marker>
+    <marker id="bar" viewBox="0 0 12 12" refX="6" refY="6" markerWidth="12" markerHeight="12" orient="auto">
+      <path d="M6,0 L6,12" fill="none" stroke="#222222" stroke-width="2"/>
+    </marker>
+  </defs>
+  <text x="800" y="52" font-size="30" text-anchor="middle" fill="#222222" data-label="title">Pharmacokinetic–pharmacodynamic model</text>
+  <g id="drug" data-node="pk">
+    <rect x="350" y="390" width="220" height="110" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+    <text x="460.0" y="442.0" font-size="27" text-anchor="middle" fill="#222222" data-label="drug">Central</text>
+    <text x="460.0" y="474.0" font-size="19" text-anchor="middle" fill="#222222" data-label="drug_sub">Vc</text>
+  </g>
+  <g data-option="route" data-value="oral">
+    <g id="depot" data-node="pk">
+      <rect x="30" y="390" width="170" height="110" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+      <text x="115.0" y="453.0" font-size="27" text-anchor="middle" fill="#222222" data-label="depot">Depot</text>
+    </g>
+    <polyline id="absorption" data-from="depot" data-to="drug" data-role="flow" points="200,445 345,445" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="272" y="425" font-size="22" text-anchor="middle" fill="#222222" data-label="ka">Ka</text>
+  </g>
+  <g data-option="route" data-value="iv" style="display:none">
+    <polyline id="dose" data-from="outside" data-to="drug" data-role="flow" points="80,445 345,445" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="205" y="425" font-size="22" text-anchor="middle" fill="#222222">Dose</text>
+  </g>
+  <g data-option="route" data-value="parallel" style="display:none">
+    <g id="depot1" data-node="pk">
+      <rect x="30" y="300" width="170" height="100" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+      <text x="115.0" y="358.0" font-size="27" text-anchor="middle" fill="#222222" data-label="depot1">Depot 1</text>
+    </g>
+    <g id="depot2" data-node="pk">
+      <rect x="30" y="570" width="170" height="100" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+      <text x="115.0" y="628.0" font-size="27" text-anchor="middle" fill="#222222" data-label="depot2">Depot 2</text>
+    </g>
+    <polyline id="absorption1" data-from="depot1" data-to="drug" data-role="flow" points="200,350 270,350 345,415" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="275" y="330" font-size="22" text-anchor="middle" fill="#222222" data-label="ka1">Ka1</text>
+    <polyline id="absorption2" data-from="depot2" data-to="drug" data-role="flow" points="200,620 270,620 345,475" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="275" y="650" font-size="22" text-anchor="middle" fill="#222222" data-label="ka2">Ka2</text>
+    <text x="115" y="285" font-size="19" text-anchor="middle" fill="#222222" data-label="fraction1">F1</text>
+    <text x="115" y="700" font-size="19" text-anchor="middle" fill="#222222" data-label="fraction2">F2 · ALAG2</text>
+  </g>
+  <g data-option="peripheral" data-value="one">
+    <g id="peripheral" data-node="pk">
+      <rect x="350" y="100" width="220" height="100" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+      <text x="460.0" y="147.0" font-size="27" text-anchor="middle" fill="#222222" data-label="peripheral">Peripheral</text>
+      <text x="460.0" y="179.0" font-size="19" text-anchor="middle" fill="#222222" data-label="peripheral_sub">Vp</text>
+    </g>
+    <polyline id="q_return" data-from="peripheral" data-to="drug" data-role="flow" points="405,200 405,385" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <polyline id="q_out" data-from="drug" data-to="peripheral" data-role="flow" points="515,390 515,205" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="540" y="290" font-size="22" text-anchor="start" fill="#222222" data-label="q">Q</text>
+  </g>
+  <g data-option="peripheral2" data-value="yes" style="display:none">
+    <g id="peripheral2" data-node="pk">
+      <rect x="690" y="100" width="220" height="100" rx="14" fill="#edf4fc" stroke="#426d98" stroke-width="2"/>
+      <text x="800.0" y="147.0" font-size="27" text-anchor="middle" fill="#222222" data-label="peripheral2">Peripheral 2</text>
+      <text x="800.0" y="179.0" font-size="19" text-anchor="middle" fill="#222222" data-label="peripheral2_sub">Vp2</text>
+    </g>
+    <polyline id="q2_out" data-from="drug" data-to="peripheral2" data-role="flow" points="570,415 625,415 625,140 685,140" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="620" y="240" font-size="22" text-anchor="middle" fill="#222222" data-label="q2">Q2</text>
+    <polyline id="q2_return" data-from="peripheral2" data-to="drug" data-role="flow" points="690,175 660,175 660,475 575,475" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+  </g>
+  <polyline id="clearance" data-from="drug" data-to="outside" data-role="flow" points="460,500 460,670" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="490" y="590" font-size="22" text-anchor="start" fill="#222222" data-label="clearance">CL</text>
+  <g id="response" data-node="pd">
+    <rect x="1100" y="390" width="240" height="110" rx="14" fill="#eef6eb" stroke="#588557" stroke-width="2"/>
+    <text x="1220.0" y="453.0" font-size="27" text-anchor="middle" fill="#222222" data-label="response">Response</text>
+  </g>
+  <g data-option="pd" data-value="direct">
+    <polyline id="direct_effect" data-from="drug" data-to="response" data-role="information" points="570,445 1095,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+    <text x="835" y="422" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">Effect</text>
+  </g>
+  <g data-option="pd" data-value="effect" style="display:none">
+    <g id="effect_site" data-node="pd">
+      <rect x="760" y="390" width="190" height="110" rx="14" fill="#eef6eb" stroke="#588557" stroke-width="2"/>
+      <text x="855.0" y="442.0" font-size="27" text-anchor="middle" fill="#222222" data-label="effect_site">Effect site</text>
+      <text x="855.0" y="474.0" font-size="19" text-anchor="middle" fill="#222222" data-label="effect_site_sub">Ce</text>
+    </g>
+    <polyline id="equilibration" data-from="drug" data-to="effect_site" data-role="information" points="570,445 755,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+    <text x="662" y="422" font-size="22" text-anchor="middle" fill="#222222" data-label="ke0">Ke0</text>
+    <polyline id="site_effect" data-from="effect_site" data-to="response" data-role="information" points="950,445 1095,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+    <text x="1022" y="422" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">Effect</text>
+  </g>
+  <g data-option="pd" data-value="turnover" style="display:none">
+    <polyline id="response_input" data-from="outside" data-to="response" data-role="flow" points="850,445 1095,445" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="970" y="422" font-size="22" text-anchor="middle" fill="#222222" data-label="synthesis">Kin</text>
+    <polyline id="response_loss" data-from="response" data-to="outside" data-role="flow" points="1340,445 1545,445" fill="none" stroke="#222222" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="1442" y="422" font-size="22" text-anchor="middle" fill="#222222" data-label="target_loss">Kout</text>
+    <g data-option="turnover" data-value="inhibit_kin" style="display:none">
+      <polyline id="turnover_effect" data-from="drug" data-to="response_input" data-role="effect" points="570,480 650,480 650,710 970,710 970,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5"/>
+      <polyline points="970,433 970,457" fill="none" stroke="#222222" stroke-width="2" data-decoration="inhibition-bar"/>
+      <text x="1030" y="694" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">inhibits Kin</text>
+    </g>
+    <g data-option="turnover" data-value="stimulate_kin" style="display:none">
+      <polyline id="turnover_effect" data-from="drug" data-to="response_input" data-role="effect" points="570,480 650,480 650,710 970,710 970,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+      <text x="1030" y="694" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">stimulates Kin</text>
+    </g>
+    <g data-option="turnover" data-value="inhibit_kout" style="display:none">
+      <polyline id="turnover_effect" data-from="drug" data-to="response_loss" data-role="effect" points="570,480 650,480 650,710 1442,710 1442,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5"/>
+      <polyline points="1442,433 1442,457" fill="none" stroke="#222222" stroke-width="2" data-decoration="inhibition-bar"/>
+      <text x="1030" y="694" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">inhibits Kout</text>
+    </g>
+    <g data-option="turnover" data-value="stimulate_kout" style="display:none">
+      <polyline id="turnover_effect" data-from="drug" data-to="response_loss" data-role="effect" points="570,480 650,480 650,710 1442,710 1442,445" fill="none" stroke="#222222" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+      <text x="1030" y="694" font-size="22" text-anchor="middle" fill="#222222" data-label="effect">stimulates Kout</text>
+    </g>
+  </g>
+</svg>

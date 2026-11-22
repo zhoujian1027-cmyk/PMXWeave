@@ -1,0 +1,31 @@
+variable,label,description,type,unit,code,value_label,status,notes,endpoint_unit,unit_status
+ID,Subject identifier,Unique subject identifier; repeated records belong to the same simulated patient.,identifier,,,,confirmed,,,not_applicable
+TIME,Time,Elapsed time from the first administration.,time,h,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+DV,Observed ligand or target concentration,Original natural-scale measurement: CMT=1 is free ligand concentration; CMT=2 is total target concentration.,observation,nM,,,confirmed,Both endpoint units and free-ligand/total-target identities are explicitly stated in the control stream. The estimation alias is DV=LNDV.,,confirmed
+LNDV,Natural-log observed response,Natural logarithm of the numerical original DV. The model aliases DV=LNDV; do not log this column again.,observation,1,,,confirmed,The reference scale is the natural-scale endpoint unit documented under DV and the endpoint selector.,,confirmed
+AMT,Dose amount,Ligand amount administered to the central compartment as an IV bolus.,dose,nmol,,,confirmed,The numeric amount agrees with the explicit nmol dose-group label.,,confirmed
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,0,Observation,confirmed,,,not_applicable
+EVID,Event identifier,NONMEM event type; this dataset contains observation and dosing records.,event,,1,Dose administration,confirmed,,,not_applicable
+CMT,Source compartment or endpoint selector,CMT=1 identifies central ligand dosing and free-ligand observations; CMT=2 identifies total-target observations.,endpoint,,1,Free ligand concentration,confirmed,The pipeline derives DVID from this field. Model A(1) is total ligand amount in nmol; A(2) is total target concentration in nM.,nM,confirmed
+CMT,Source compartment or endpoint selector,CMT=1 identifies central ligand dosing and free-ligand observations; CMT=2 identifies total-target observations.,endpoint,,2,Total target concentration,confirmed,The pipeline derives DVID from this field. Model A(1) is total ligand amount in nmol; A(2) is total target concentration in nM.,nM,confirmed
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,0,Usable observation,confirmed,,,not_applicable
+MDV,Missing dependent variable flag,NONMEM flag controlling whether the record contributes a dependent-variable observation.,event,,1,DV not used as an observation,confirmed,,,not_applicable
+ADDL,Additional doses,Number of additional doses implied by this record; all values are zero in the current dataset.,regimen,,,,confirmed,,,not_applicable
+II,Interdose interval,Interval used with ADDL or steady-state dosing; all values are zero because administrations are explicit records.,regimen,h,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+RATE,Infusion rate,Ligand administration rate; all current records use zero for IV bolus dosing.,regimen,nmol/h,,,confirmed,,,confirmed
+STUDYID,Study,Study identifier; all simulated records belong to Study 101.,study,,101,Study 101,confirmed,,,not_applicable
+BW,Body weight,Baseline body weight.,continuous,kg,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+SEX,Sex,Recorded sex category.,categorical,,1,Male,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+SEX,Sex,Recorded sex category.,categorical,,2,Female,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+AGE,Age,Baseline age.,continuous,years,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+RACE,Race,Recorded race category.,categorical,,1,White,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,2,Asian,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,3,Black or African American,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+RACE,Race,Recorded race category.,categorical,,4,Other,confirmed,Category coding explicitly confirmed by the user.,,not_applicable
+WTBL,Baseline body weight,Baseline body-weight alias; exactly duplicates BW in the current dataset.,continuous,kg,,,confirmed,"Keep the original column, but do not count BW and WTBL as independent covariates.",,confirmed
+BMI,Body mass index,Baseline body mass index.,continuous,kg/m2,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+ALB,Albumin,Baseline albumin concentration.,continuous,g/dL,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+CRCL,Creatinine clearance,Baseline creatinine clearance.,continuous,mL/min,,,confirmed,Definition and unit explicitly confirmed by the user.,,confirmed
+DOSE,Dose level,"Absolute ligand dose-group label, expressed in nmol rather than mg or mg/kg.",regimen,nmol,10 nmol,10 nmol,confirmed,,,confirmed
+DOSE,Dose level,"Absolute ligand dose-group label, expressed in nmol rather than mg or mg/kg.",regimen,nmol,100 nmol,100 nmol,confirmed,,,confirmed
+DOSE,Dose level,"Absolute ligand dose-group label, expressed in nmol rather than mg or mg/kg.",regimen,nmol,1000 nmol,1000 nmol,confirmed,,,confirmed

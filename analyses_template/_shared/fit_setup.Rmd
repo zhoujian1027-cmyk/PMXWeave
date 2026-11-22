@@ -1,0 +1,34 @@
+```{r setup, include=FALSE}
+.cpu_paths <- c(file.path(dirname(Sys.getenv("STAGES_DIR")),"cpu_budget.R"),
+                file.path(Sys.getenv("PMX_TOOLKIT"),"word-report","cpu_budget.R"),
+                ".pmx/word-report/cpu_budget.R", ".pmx/pmx_workspace/word-report/cpu_budget.R",
+                "../.pmx/pmx_workspace/word-report/cpu_budget.R", "word-report/cpu_budget.R")
+.cpu_path <- .cpu_paths[file.exists(.cpu_paths)][1]
+if(is.na(.cpu_path)) stop("PMX_CPU_TOOLKIT_REQUIRED: complete reusable toolkit required")
+source(.cpu_path)
+source(file.path(dirname(.cpu_path),"ppk_report_support.R"))
+pmx_cpu_setup(threads=1L)
+
+knitr::opts_chunk$set(error=FALSE,
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 4
+)
+
+pmx_fit_caption_style <- paste0(
+  "<style>div.figure, figure {display:flex;flex-direction:column;align-items:center}",
+  "div.figure > p.caption, figure > figcaption {order:-1;text-align:center}</style>"
+)
+
+library(nlmixr2)
+pmx_cpu_setup(threads=1L,rx=TRUE)
+library(nonmem2rx)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(gridExtra)
+library(scales)
+```

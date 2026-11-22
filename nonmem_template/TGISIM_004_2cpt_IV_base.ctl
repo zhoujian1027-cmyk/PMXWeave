@@ -1,0 +1,98 @@
+$PROBLEM Simeoni TGI 2-cpt IV | FOCE
+
+$INPUT ID TIME DV AMT EVID CMT MDV ADDL II RATE STUDYID
+
+$DATA pk_data.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+
+$MODEL COMP=(CENTRAL) COMP=(PERIPH) COMP=(W1) COMP=(W2) COMP=(W3) COMP=(W4)
+
+$PK
+; Typical values
+TVCL = THETA(1)
+TVVC = THETA(2)
+TVQ = THETA(3)
+TVVP = THETA(4)
+TVW0 = THETA(5)
+TVLAM0 = THETA(6)
+TVLAM1 = THETA(7)
+TVK2 = THETA(8)
+TVK1 = THETA(9)
+
+; PK parameters
+CL = TVCL * EXP(ETA(1))
+VC = TVVC * EXP(ETA(2))
+Q = TVQ * EXP(ETA(3))
+VP = TVVP * EXP(ETA(4))
+
+; Tumor growth/kill parameters
+PSI = 20    ; PSI
+W0 = TVW0 * EXP(ETA(5))
+LAM0 = TVLAM0 * EXP(ETA(6))
+LAM1 = TVLAM1 * EXP(ETA(7))
+K2 = TVK2 * EXP(ETA(8))
+K1 = TVK1
+A_0(3) = W0
+
+$DES
+K10 = CL/VC
+K12 = Q/VC
+K21 = Q/VP
+DADT(1) = -K10*A(1) - K12*A(1) + K21*A(2)
+DADT(2) = K12*A(1) - K21*A(2)
+W = A(3) + A(4) + A(5) + A(6)    ; total tumor size
+C2 = A(1)/VC    ; drug concentration
+GROWTH = LAM0*A(3)/(1+(LAM0/LAM1*W)**PSI)**(1/PSI)
+DADT(3) = GROWTH - K2*C2*A(3)
+DADT(4) = K2*C2*A(3) - K1*A(4)
+DADT(5) = K1*(A(4) - A(5))
+DADT(6) = K1*(A(5) - A(6))
+
+$ERROR
+PKCONC = A(1)/VC
+PDRESP = A(3) + A(4) + A(5) + A(6)
+
+IPRED = LOG(0.0001)
+Y     = IPRED
+
+IF (CMT.EQ.1.AND.PKCONC.GT.0) THEN
+  IPRED = LOG(PKCONC)
+  Y = IPRED + EPS(1)
+ENDIF
+
+IF (CMT.EQ.3.AND.PDRESP.GT.0) THEN
+  IPRED = LOG(PDRESP)
+  Y = IPRED + EPS(2)
+ENDIF
+
+$THETA
+(0, 0.5) ; THETA(1) TVCL
+(0, 2) ; THETA(2) TVVC
+(0, 1) ; THETA(3) TVQ
+(0, 2) ; THETA(4) TVVP
+(0, 0.2) ; THETA(5) TVW0
+(0, 0.3) ; THETA(6) TVLAM0
+(0, 0.1) ; THETA(7) TVLAM1
+(0, 1) ; THETA(8) TVK2
+(0, 1) ; THETA(9) TVK1
+
+$OMEGA
+0.2         ; ETA(1) CL
+0.2         ; ETA(2) VC
+0.2         ; ETA(3) Q
+0.2         ; ETA(4) VP
+0.2         ; ETA(5) W0
+0.2         ; ETA(6) LAM0
+0.2         ; ETA(7) LAM1
+0.2         ; ETA(8) K2
+
+$SIGMA
+0.1 ; PK log-additive error
+0.1 ; Tumor log-additive error
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 SIGL=9 NOABORT
+
+$COVARIANCE UNCONDITIONAL PRINT=E
+
+$TABLE ID TIME DV PRED IPRED CMT CWRES NOPRINT ONEHEADER FILE=output FORMAT=1F12.5

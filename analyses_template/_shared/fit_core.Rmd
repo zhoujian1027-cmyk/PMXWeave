@@ -1,0 +1,25 @@
+```{r fit-model, include=FALSE}
+
+ctl_path <- local({
+  nm   <- FIT_CTL
+  cand <- c(nm, file.path("..", nm), file.path("02_html", nm))
+  hit  <- cand[file.exists(cand)]
+  if (!length(hit)) stop("control stream not found: ", nm,
+                         "\n  looked in: ", paste(cand, collapse = ", "), call. = FALSE)
+  hit[1]
+})
+m_ctl <- nonmem2rx(ctl_path, lst = ".res", save = FALSE, validate = FALSE,
+                   thetaNames = FIT_THETA, etaNames = FIT_ETA)
+
+m_ctl <- FIT_ENDPOINT(m_ctl)
+
+fit_data <- FIT_PREP(df)
+
+fit <- nlmixr2(m_ctl, fit_data, est = "focei", foceiControl(covMethod = "s"),
+               rxControl(atol = 1e-8, rtol = 1e-6))
+
+if (isTRUE(FIT_REFIT)) {
+  fit <- nlmixr2(fit, fit_data, est = "focei", foceiControl(covMethod = "s"),
+                 rxControl(atol = 1e-8, rtol = 1e-6))
+}
+```

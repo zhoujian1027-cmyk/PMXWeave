@@ -1,0 +1,764 @@
+---
+title: "PK/PD Analysis Report"
+author: "PMX Agent"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    fig_width: 9
+    fig_height: 4
+---
+
+```{r setup, include=FALSE}
+.cpu_paths <- c(file.path(dirname(Sys.getenv("STAGES_DIR")),"cpu_budget.R"),
+                file.path(Sys.getenv("PMX_TOOLKIT"),"word-report","cpu_budget.R"),
+                ".pmx/word-report/cpu_budget.R", ".pmx/pmx_workspace/word-report/cpu_budget.R",
+                "../.pmx/pmx_workspace/word-report/cpu_budget.R", "word-report/cpu_budget.R")
+.cpu_path <- .cpu_paths[file.exists(.cpu_paths)][1]
+if(is.na(.cpu_path)) stop("PMX_CPU_TOOLKIT_REQUIRED: complete reusable toolkit required")
+source(.cpu_path)
+source(file.path(dirname(.cpu_path),"pkpd_report_contract.R"))
+source(file.path(dirname(.cpu_path),"..","analyses_template","tools","model_contract.R"))
+pmx_cpu_setup(threads=1L)
+
+knitr::opts_chunk$set(error=FALSE,
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 4
+)
+
+library(nlmixr2)
+pmx_cpu_setup(threads=1L,rx=TRUE)
+library(mrgsolve)   # EBE exposure is also used when RUN_VPC is false
+library(nonmem2rx)
+library(nlmixr2save)   # loadFit() - the stage-2 fit archive
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(gridExtra)
+library(scales)
+```
+
+```{r switches}
+RUN_VPC           <- TRUE    # Visual Predictive Check (mrgsolve + tidyvpc)
+RUN_STRUCTURE_FIG <- TRUE    # Shared source-matched SVG/PNG skeleton
+USE_SCM_FINAL     <- TRUE    # report the stage-2 SCM final model when one was saved
+SHOW_BOOTSTRAP    <- TRUE    # bootstrap section, when stage 2 saved one
+SHOW_SCM          <- TRUE    # covariate-search section, when stage 2 saved one
+VPC_NSIM          <- 500     # number of simulated replicates for the VPC
+PK_ENDPOINT       <- 1L      # Model endpoint index, independently of original DVID labels.
+PD_ENDPOINT       <- 2L
+PKPD_DV_SCALE     <- c(PK="auto",PD="auto") # Two measured DVs default to log DV (nonmem_rules.md); auto resolves it.
+PKPD_SIM_SCALE    <- NULL   # Resolved from the fitted DV scale below: a simulator capture and the
+                            # fit's PRED share the model scale, the dataset DV column is natural.
+PKPD_SIGMA_MAP    <- NULL    # EPS order: fitted residual SD names; required if more than two SDs.
+PK_UNIT           <- ""      # Declare the study concentration unit; no unit conversion is performed.
+DOSE_UNIT         <- ""      # Declare the actual dose unit.
+VPC_LOG_YMIN      <- NULL    # Expected: NULL for automatic positive limit, or a positive concentration.
+SEX_FEMALE_CODE   <- NULL     # Expected: source-data code for female.
+SEX_MALE_CODE     <- NULL     # Expected: source-data code for male.
+```
+
+```{r load-simulator, eval=RUN_VPC, include=FALSE}
+suppressPackageStartupMessages({
+  library(mrgsolve)   # simulate from the .cpp model
+  library(tidyvpc)    # VPC statistics and plotting
+})
+```
+
+```{r load-estimates, include=FALSE}
+pmx_input <- function(nm, what = "report input", required = TRUE) {
+  if(grepl("_data[.]csv$",nm) && nzchar(Sys.getenv("PMX_DATA",""))) return(Sys.getenv("PMX_DATA"))
+  cand <- c(file.path("02_html", nm), nm, file.path("..", "02_html", nm), file.path("..", nm))
+  hit <- cand[file.exists(cand)]
+  if (length(hit)) return(hit[1])
+  if (required) stop(what, " not found: ", nm,
+                     "\n  looked in: ", paste(unique(cand), collapse = ", "),
+                     "\n  stage 2 (s2_freeze.R) writes <fam>_estimates.zip and <fam>_scm_final.zip",
+                     " into 02_html/; the model .cpp files and the dataset live beside it",
+                     call. = FALSE)
+  NA_character_
+}
+SCM_FINAL <- pmx_input("pkpd_scm_final.zip", "stage-2 SCM fit archive", required = FALSE)
+use_scm <- USE_SCM_FINAL && !is.na(SCM_FINAL)
+fit <- nlmixr2save::loadFit(sub("\\.zip$", "", if (use_scm) SCM_FINAL else
+  pmx_input("pkpd_estimates.zip", "stage-2 base fit archive")))
+CPP_SIM <- pmx_input("final_model.cpp", "mrgsolve translation of the final model")
+CPP_EBE <- pmx_input("pkpd_ebe.cpp", "EBE exposure simulator")
+# S2 simulator sources are immutable gate artifacts. Rendering updates private copies.
+private_simulator <- function(path) {
+  destination <- tempfile("pmx_sim_",fileext=".cpp")
+  code <- readLines(path,warn=FALSE)
+  writeLines(gsub("\\bIPRED2\\b","IPRED_PD",code),destination)
+  destination
+}
+CPP_SIM <- private_simulator(CPP_SIM)
+CPP_EBE <- private_simulator(CPP_EBE)
+
+fixef_clean <- local({
+  fe  <- fixef(fit)
+  nm  <- names(fe)
+  ini <- tryCatch(as.data.frame(fit$iniDf), error = function(e) NULL)
+  if (!is.null(ini)) for (k in seq_along(nm)) {
+    hit <- match(nm[k], ini$name)
+    if (is.na(hit)) hit <- match(sub("^t\\.", "", nm[k]), ini$name)
+    if (!is.na(hit) && grepl("THETA", ini$label[hit]))
+      nm[k] <- sub("\\s*\\[[^]]*\\]\\s*$", "", sub("\\s*\\(.*\\)\\s*$", "", trimws(sub("^.*THETA\\([0-9]+\\)", "", ini$label[hit]))))
+  }
+  stats::setNames(as.numeric(fe), nm)
+})
+
+frozen_path <- pmx_input("artifacts/s2/final.rds","frozen SCM record",required=FALSE)
+frozen_search <- if(!is.na(frozen_path)) readRDS(frozen_path)$search else NULL
+scm_cov <- unique(toupper(c(tryCatch(as.character(fit$muRefCovariateDataFrame$covariate),error=function(e) character()),
+  unlist(lapply(frozen_search$added,function(group) vapply(group,function(e) e$cov,""))))))
+SCM_CPP_MAP <- c(vc = "VC", cl = "CL")
+report_ctl <- pmx_input("artifacts/s2/final_fitted.ctl","frozen endpoint/response contract")
+report_contract <- pmx_pkpd_contract(report_ctl,PK_ENDPOINT,PD_ENDPOINT,PKPD_DV_SCALE)
+if (is.null(PKPD_SIM_SCALE)) PKPD_SIM_SCALE <- report_contract$scale
+report_contract$endpoints <- fit$ui$predDf
+report_data <- pmx_read_data(pmx_input("pkpd_data.csv"),report_ctl)
+if(is.null(PKPD_SIGMA_MAP)) {
+  if(length(report_contract$sigma)!=2L) stop("PKPD_SIGMA_MAP_REQUIRED: declare fitted SD names in simulator EPS order")
+  PKPD_SIGMA_MAP <- report_contract$sigma
+}
+PK_YLAB <- if(nzchar(PK_UNIT)) paste0("Concentration (",PK_UNIT,")") else "Concentration"
+DOSE_YLAB <- if(nzchar(DOSE_UNIT)) paste0("Dose (",DOSE_UNIT,")") else "Dose"
+
+dat <- tryCatch(as.data.frame(fit$origData), error = function(e) NULL)
+if (is.null(dat) || !nrow(dat))
+  stop("stage 3: the saved fit carries no origData - re-run stage 2")
+id_col <- if ("ID" %in% names(dat)) "ID" else "id"
+
+pmx_shared_src <- function(f) {
+  tk <- if (exists(".cpu_path")) dirname(dirname(.cpu_path)) else ""
+  dirs <- c(if (nzchar(tk)) file.path(tk, "analyses_template", "_shared"),
+            file.path(Sys.getenv("PMX_TOOLKIT"), "analyses_template", "_shared"),
+            ".pmx/pmx_workspace/analyses_template/_shared",
+            "../.pmx/pmx_workspace/analyses_template/_shared",
+            "../../.pmx/pmx_workspace/analyses_template/_shared",
+            "analyses_template/_shared", "../../analyses_template/_shared",
+            "../analyses_template/_shared", "_shared", "../_shared")
+  cand <- unique(file.path(dirs[nzchar(dirs)], f))
+  hit <- cand[file.exists(cand)]
+  if (!length(hit)) stop("PMX_REPORT_SHARED_MISSING: ", f,
+                         " not found; the toolkit that supplied cpu_budget.R must also carry analyses_template/_shared")
+  hit[1]
+}
+source(pmx_shared_src("report_aug.R"))
+est_aug <- pmx_est_aug(fit, CPP_SIM, fixed=fixef_clean, sigma_map=PKPD_SIGMA_MAP,
+  endpoints = stats::setNames(c("IPRED", "IPRED_PD"), c(PK_ENDPOINT, PD_ENDPOINT)),
+  prediction_transform=function(x,ep) pmx_pkpd_sim_to_model(x,ep,report_contract,PKPD_SIM_SCALE))
+if(!all(c("DV","PRED","IPRED") %in% toupper(names(est_aug))))
+  stop("PKPD_REPORT_PREDICTIONS_REQUIRED: complete the matching S1C/addTable; never invent predictions or refit for report formatting")
+
+est <- list(
+  fixef      = fixef_clean,
+  aug        = est_aug,
+  parFixedDf = as.data.frame(fit$parFixedDf),
+  iniDf      = as.data.frame(fit$iniDf),
+  cov        = tryCatch(as.matrix(fit$cov), error = function(e) NULL),
+  eta        = local({
+    e <- tryCatch(as.data.frame(fit$eta), error = function(e) NULL)
+    if (is.null(e) || !nrow(e)) e <- tryCatch(as.data.frame(fit$ranef), error = function(e) NULL)
+    if (is.null(e) || !nrow(e)) return(NULL)
+    names(e) <- toupper(names(e))
+    e
+  }),
+  objf       = tryCatch(fit$objf, error = function(e) NA_real_),
+  aic        = tryCatch(AIC(fit), error = function(e) NA_real_),
+  bic        = tryCatch(BIC(fit), error = function(e) NA_real_),
+  loglik     = tryCatch(as.numeric(logLik(fit)), error = function(e) NA_real_),
+  message    = tryCatch(as.character(fit$message), error = function(e) NULL),
+  covMethod  = tryCatch(as.character(unlist(fit$covMethod)), error = function(e) NULL),
+  runInfo    = tryCatch(as.character(unlist(fit$runInfo)), error = function(e) character(0)),
+  n_subj     = length(unique(dat[[id_col]])),
+  n_obs_pk   = sum(dat$evid == 0 & dat$mdv == 0 & dat$dvid == PK_ENDPOINT,na.rm=TRUE),
+  n_obs_pd   = sum(dat$evid == 0 & dat$mdv == 0 & dat$dvid == PD_ENDPOINT,na.rm=TRUE)
+)
+
+est$aug <- pmx_pkpd_aug(est$aug,report_data,report_contract)
+cat("REPORT_DV_SCALE alias=",pmx_dv_alias(report_ctl)," scale=",paste(report_contract$scale,collapse="/"),
+    " convert=",pmx_dv_needs_natural(report_ctl),"\n",sep="")
+
+observation_aug <- function(d) {
+  if("EVID" %in% names(d)) d <- d[!is.na(d$EVID) & d$EVID==0,,drop=FALSE]
+  if("MDV" %in% names(d)) d <- d[!is.na(d$MDV) & d$MDV==0,,drop=FALSE]
+  d
+}
+unique_prediction <- function(d,key) {
+  if(!nrow(d)) return(d)
+  d <- distinct(d)
+  if(anyDuplicated(d[,key,drop=FALSE])) stop("Ambiguous predictions at duplicate ID/time/endpoint; provide record-level matching")
+  d
+}
+sample_subjects <- function(x,n=9L) {
+  x <- unique(x[!is.na(x)])
+  if(!length(x)) return(x)
+  x[sample.int(length(x),min(n,length(x)))]
+}
+
+dose_fct <- function(x) {
+  u <- unique(as.character(x))
+  n <- suppressWarnings(as.numeric(sub("^\\s*([0-9.]+).*$", "\\1", u)))
+  factor(as.character(x), levels = if (all(!is.na(n))) u[order(n)] else sort(u))
+}
+
+vpc_panels <- function(p, ylab) {
+  pmx_fit_vpc_panels(p,ylab,log_ymin=VPC_LOG_YMIN)
+}
+
+prof_panels <- function(prof, ylab) {
+  floor_lo <- min(prof$Mean[prof$Mean > 0], na.rm = TRUE) / 2
+  prof <- prof %>%
+    mutate(lo = pmax(Mean - SD, floor_lo), hi = Mean + SD)
+  prof <- prof %>% mutate(DOSE = dose_fct(DOSE))
+  p <- ggplot(prof, aes(TIME, Mean, colour = DOSE)) +
+    geom_line() + geom_point(size = 1.6) +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.6, alpha = 0.5) +
+    labs(x = "Time (h)", y = ylab, colour = "Dose") + theme_bw()
+  gridExtra::grid.arrange(
+    p + labs(y = paste0(ylab, " (linear scale)")),
+    p + scale_y_log10() + labs(y = paste0(ylab, " (log scale)")),
+    nrow = 1)
+}
+
+```
+
+```{r report-support, include=FALSE}
+report_dirs <- c(file.path(dirname(Sys.getenv("STAGES_DIR","")),"ppk_report_support.R"),
+  file.path(Sys.getenv("PMX_TOOLKIT",""),"word-report","ppk_report_support.R"),
+  file.path(dirname(.cpu_path),"ppk_report_support.R"))
+report_support <- report_dirs[file.exists(report_dirs)]
+if(!length(report_support)) stop("PPK report support missing: use the complete workspace toolkit")
+source(report_support[1])
+source(file.path(dirname(report_support[1]),"result_narrative.R"))
+report_root <- Sys.getenv("PMX_ROOT",getwd())
+current_bundle <- tryCatch(pmx_result_bundle(report_root,"pkpd",pmx_input("pkpd_data.csv")),error=function(e) NULL)
+current_prose <- if(is.null(current_bundle)) list() else pmx_study_prose(report_root,current_bundle)
+fit_result_text <- function(title) {
+  text <- current_prose$SectionResults[[title]]
+  if(length(text)) cat(paste(text,collapse="\n\n"),"\n\n")
+}
+```
+
+<style>
+table td, table th {text-align:center;word-break:normal;overflow-wrap:normal;}
+table th:first-child, table td:first-child {text-align:left;}
+table.ppk-parameters th:nth-child(2), table.ppk-parameters td:nth-child(2) {text-align:left;}
+table.ppk-parameters td:first-child:has(strong) {white-space:nowrap;}
+.baseline-characteristics {width:100%;table-layout:auto;}
+.baseline-characteristics th:first-child {min-width:30%;}
+.baseline-characteristics td:first-child {white-space:pre-line;}
+</style>
+
+```{r read-data}
+df <- report_data
+names(df) <- toupper(names(df))
+df$SOURCE_DVID <- df$NMDVID
+.dv_raw <- pmx_read_data(pmx_input("pkpd_data.csv"))
+names(.dv_raw) <- toupper(names(.dv_raw))
+df$DV <- pmx_observed_dv(.dv_raw, report_ctl,
+  convert = function(x) pmx_pkpd_natural(x, df$DVID, report_contract))
+pk_obs <- df %>% filter(EVID == 0, MDV == 0, DVID == PK_ENDPOINT)
+pd_obs <- df %>% filter(EVID == 0, MDV == 0, DVID == PD_ENDPOINT)
+
+# A documented baseline-weight alias is a report view, never an original-data rewrite.
+if(!"BW" %in% names(df) && "WTBL" %in% names(df)) df$BW <- df$WTBL
+for(v in c("AGE","BW","BMI","ALB","CRCL","SEX","RACE","DOSE")) if(!v %in% names(df)) df[[v]] <- NA_real_
+if(!"MDV" %in% names(df)) df$MDV <- as.integer(df$EVID!=0 | is.na(df$DV))
+cov_tab <- df %>% distinct(ID, .keep_all = TRUE)
+
+summary_tab <- data.frame(
+  Metric = c("Subjects", "Total records", "PK observations", "PD observations",
+             paste0(DOSE_YLAB," groups"), "Subjects per dose group", "Median BW (kg)"),
+  Value = c(
+    nrow(cov_tab),
+    nrow(df),
+    nrow(pk_obs),
+    nrow(pd_obs),
+    paste(sort(unique(cov_tab$DOSE)), collapse = ", "),
+    paste(sprintf("%s: n=%d", names(table(cov_tab$DOSE)),
+                  as.integer(table(cov_tab$DOSE))), collapse = "; "),
+    round(median(cov_tab$BW, na.rm = TRUE), 1)
+  )
+)
+kable(summary_tab, caption = "Dataset Summary", align = "lc")
+```
+
+# Modelling Methods
+
+```{r reusable-methods, results='asis'}
+methods <- pmx_fit_method_sections(if(is.null(current_bundle)) list() else current_bundle$result,"pkpd")
+for(title in names(methods)) {
+  cat("\n\n## ",sub("^[0-9.]+ +","",title),"\n\n",sep="")
+  cat(paste(methods[[title]],collapse="\n\n"),"\n\n")
+}
+```
+
+# 1. Data Overview
+
+```{r data-sources-and-handling, results='asis', echo=FALSE}
+source_metadata <- file.path(report_root,"report_metadata.dcf")
+data_meta <- if(file.exists(source_metadata)) as.list(read.dcf(source_metadata)[1,]) else list()
+data_sections <- pmx_fit_data_sections(pmx_input("pkpd_data.csv"),
+  if(is.null(current_bundle)) list() else current_bundle$result,"pkpd",data_meta)
+for(title in names(data_sections)) {
+  label <- sub("^[0-9.]+[[:space:]]+","",title)
+  cat("\n\n**",label,".** ",data_sections[[title]],"\n\n",sep="")
+}
+```
+
+```{r data-interpretation, results='asis'}
+fit_result_text("5.1 Data")
+```
+
+## 1.1 PK Concentration-Time (Mean ± SD by Dose)
+
+```{r profile-pk, fig.width=10, fig.height=4, fig.cap="Observed PK concentration-time profiles by dose"}
+prof <- df %>% filter(EVID==0, MDV==0, DVID == PK_ENDPOINT) %>% group_by(DOSE, TIME) %>%
+  summarise(n = dplyr::n(), Mean = mean(DV, na.rm = TRUE),
+            SD = sd(DV, na.rm = TRUE), .groups = "drop")
+prof_panels(prof, PK_YLAB)
+```
+
+## 1.2 PD Response-Time (Mean ± SD by Dose)
+
+```{r profile-pd, fig.width=10, fig.height=4, fig.cap="Observed PD response-time profiles by dose"}
+prof <- df %>% filter(EVID==0, MDV==0, DVID == PD_ENDPOINT) %>% group_by(DOSE, TIME) %>%
+  summarise(n = dplyr::n(), Mean = mean(DV, na.rm = TRUE),
+            SD = sd(DV, na.rm = TRUE), .groups = "drop")
+prof_panels(prof, "PD response")
+```
+
+## 1.3 Sample Distribution
+
+```{r sample-dist}
+samp <- df %>% filter(EVID == 0) %>%
+  mutate(DOSE = dose_fct(DOSE)) %>% count(ID, DOSE, name = "n_samples")
+samp_tab <- samp %>% group_by(DOSE) %>%
+  summarise(Subjects = dplyr::n(), `Total samples` = sum(n_samples),
+            `Min per subject` = min(n_samples),
+            `Median per subject` = median(n_samples),
+            `Max per subject` = max(n_samples), .groups = "drop")
+kable(samp_tab, caption = "Observed samples per subject by dose group",
+      align = "lccccc")
+```
+
+## 1.4 Covariate Correlation
+
+```{r cov-cor, fig.width=7, fig.height=6, fig.cap="Pearson correlation between continuous covariates"}
+cc <- cov_tab %>% select(AGE, BW, BMI, ALB, CRCL)
+cm <- cor(cc, use = "pairwise.complete.obs")
+ggplot(as.data.frame(as.table(cm)), aes(Var1, Var2, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3.2) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, limits = c(-1, 1), name = "r") +
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_bw() + theme(panel.grid = element_blank())
+```
+
+## 1.5 Covariate Summary
+
+```{r cov-summary, results="asis"}
+
+cov_df <- df
+
+con_cov <- c("AGE", "BW", "BMI", "ALB", "CRCL")
+cat_cov <- c("SEX", "RACE", "DOSE")
+
+var_labels <- pmx_fit_covariate_labels(c(
+  AGE="Age",BW="Body weight",BMI="BMI",ALB="Albumin",
+  CRCL="Creatinine clearance",SEX="Sex",RACE="Race",DOSE="Dose level"))
+
+cov_table <- pmx_patient_characteristics(cov_df,con_cov,cat_cov,var_labels,
+  level_display=pmx_fit_level_display,
+  id="ID",label_column="Covariates")
+pmx_fit_characteristics_kable(cov_table)
+```
+
+# 2. Base Model
+
+```{r structure-fig, eval=RUN_STRUCTURE_FIG, results='asis'}
+STRUCTURE_CONFIG <- list()  # Source-matched options only; see diagrams/README.md.
+.diagram_helper <- file.path(dirname(.cpu_path), "model_diagram.R")
+if (!file.exists(.diagram_helper)) stop("MODEL_DIAGRAM_TEMPLATE_REQUIRED: use the complete toolkit")
+source(.diagram_helper)
+.diagram_ctl <- pmx_input("base_model.ctl", "base model for the structure figure")
+structure_figure <- pmx_model_diagram(.diagram_ctl, "pkpd",
+  template_dir=file.path(dirname(.cpu_path), "..", "analyses_template", "diagrams"),
+  out_dir=file.path(tempdir(), "model_structure"),
+  options=STRUCTURE_CONFIG, show_title=FALSE)
+cat(sprintf('<div class="figure"><img src="%s" style="width:100%%" /><p class="caption">Base model structure</p></div>\n',
+            knitr::image_uri(structure_figure$png)))
+```
+
+```{r base-interpretation, results='asis'}
+fit_result_text("5.2 Base model")
+```
+
+# 3. Parameter Estimates
+
+```{r final-interpretation, results='asis'}
+fit_result_text("5.4 Final model")
+```
+
+```{r param-table}
+all_tab <- pmx_fit_parameter_table(fit,if(!is.null(frozen_search$ctl)) frozen_search$ctl else character(),frozen_search$added)
+pmx_fit_kable(all_tab,"Population Parameter Estimates")
+```
+
+## 3.1 Bootstrap Confidence Intervals
+
+```{r bootstrap-report, fig.width=10, fig.height=7}
+if (SHOW_BOOTSTRAP && file.exists("pkpd_bootstrap.zip")) {
+  fit_boot <- nlmixr2save::loadFit("pkpd_bootstrap")
+  bs  <- lapply(fit_boot$bootSummary$parFixedDf, as.data.frame)
+  lvl <- if (is.null(fit_boot$bootCI)) 0.95 else fit_boot$bootCI
+  boot_tab <- data.frame(
+    Parameter       = sub("^t\\.", "", rownames(bs$mean)),
+    Estimate        = bs$mean[["Back-transformed"]],
+    Lower           = bs$confLower[["Back-transformed"]],
+    Upper           = bs$confUpper[["Back-transformed"]],
+    `%RSE`          = 100 * bs$stdDev$Estimate / bs$mean$Estimate,
+    check.names = FALSE, row.names = NULL)
+  print(kable(boot_tab, digits = 4,
+              caption = sprintf("Bootstrap percentile CI (%d replicates, %.0f %% level)",
+                                fit_boot$bootSummary$nboot, 100 * lvl),
+              col.names = c("Parameter", "Estimate", sprintf("%.0f%% CI lower", 100 * lvl),
+                            sprintf("%.0f%% CI upper", 100 * lvl), "%RSE")))
+  print(nlmixr2extra::bootplot(fit_boot))
+} else {
+  cat("Stage 2 was run without the bootstrap (RUN_BOOTSTRAP = FALSE).\n")
+}
+```
+
+## 3.2 Covariate Search (SCM)
+
+```{r scm-interpretation, results='asis'}
+fit_result_text("5.3 Covariate selection")
+```
+
+```{r scm-report}
+if (SHOW_SCM) {
+  frozen_record <- pmx_input("artifacts/s2/final.rds", "frozen SCM record", required = FALSE)
+  rec <- if (!is.na(frozen_record)) readRDS(frozen_record)$search$rec else NULL
+  if (is.null(rec)) {
+    legacy_record <- pmx_input("pkpd_scm_record.csv", "SCM record", required = FALSE)
+    if (!is.na(legacy_record)) rec <- read.csv(legacy_record, check.names = FALSE)
+  }
+  if (!is.null(rec) && nrow(rec)) {
+    fields <- if ("Model" %in% names(rec))
+      c("Step", "Model", "BIC", "Estimate", "Decision") else
+      c("step", "searchType", "covar", "var", "objf", "deltObjf",
+        "AIC", "BIC", "qchisqr", "pchisqr", "included")
+    display <- pmx_fit_scm_display(rec[, intersect(fields, names(rec)), drop = FALSE])
+    display[] <- lapply(display, function(x) {
+      if (anyNA(x)) { x <- as.character(x); x[is.na(x)] <- "" }
+      x
+    })
+    print(kable(display, digits = 4,
+                caption = "Covariate search run record (forward and backward steps)"))
+    if ("Decision" %in% names(rec) && any(rec$Decision == "Fit failed", na.rm = TRUE))
+      cat("Failed fits were excluded from model comparisons. Blank cells do not represent zero.\n")
+    if (exists("use_scm") && use_scm)
+      cat("The analysis model of this report already includes the kept effects",
+          "(their sizes are in the parameter table above).\n")
+  }
+}
+```
+
+# 4. Steady-State Exposure from the EBEs
+
+## 4.1 EBE Distributions and Correlation
+
+```{r ebe-dist, fig.width=11, fig.height=7, fig.cap="Distributions and pairwise relationships of empirical Bayes estimates"}
+ebe_long <- est$eta %>% pivot_longer(-ID, names_to = "ETA", values_to = "VALUE")
+h_ebe <- ggplot(ebe_long, aes(VALUE)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.6) +
+  facet_wrap(~ ETA, scales = "free") +
+  labs(x = "EBE", y = "Count") + theme_bw()
+
+eta_cols <- setdiff(names(est$eta), "ID")
+if (length(eta_cols) >= 2) {
+  pairs_ebe <- do.call(rbind, combn(eta_cols, 2, simplify = FALSE, function(cc)
+    data.frame(PAIR = paste(cc[1], "vs", cc[2]),
+               A = est$eta[[cc[1]]], B = est$eta[[cc[2]]])))
+  s_ebe <- ggplot(pairs_ebe, aes(A, B)) +
+    geom_point(alpha = 0.4, size = 0.7, colour = "steelblue") +
+    geom_smooth(method = "lm", se = FALSE, colour = "red") +
+    facet_wrap(~ PAIR, scales = "free") +
+    labs(x = "EBE (first of pair)", y = "EBE (second of pair)") + theme_bw()
+  grid.arrange(h_ebe, s_ebe, nrow = 2)
+} else {
+  h_ebe
+}
+```
+
+## 4.2 Steady-State Exposure
+
+```{r ebe-exposure-sim, fig.width=10, fig.height=4}
+idat <- as.data.frame(est$eta)
+idat$ID <- suppressWarnings(as.integer(as.character(idat$ID)))
+if(anyNA(idat$ID)) stop("Exposure simulation requires numeric subject IDs")
+.ebe_cpp <- pmx_fit_ebe_source(CPP_EBE,CPP_SIM,"IPRED_PD")
+update_cpp_covariates(.ebe_cpp,fit,SCM_CPP_MAP)
+mod_ebe <- pmx_report_update_model(mread(.ebe_cpp,quiet=TRUE),est,PKPD_SIGMA_MAP,residual=FALSE)
+ebe_params <- names(param(mod_ebe))
+ebe_source <- paste(readLines(.ebe_cpp,warn=FALSE),collapse="\n")
+has_pd_capture <- pmx_fit_has_capture(.ebe_cpp,"IPRED_PD")
+eta_positions <- unique(as.integer(gsub("[^0-9]","",unlist(regmatches(ebe_source,gregexpr("ETA\\([0-9]+\\)",ebe_source))))))
+ebe_names <- setdiff(names(idat),"ID")
+if(length(eta_positions)) {
+  if(max(eta_positions)!=length(ebe_names)) stop("Simulator ETA ordering/dimension differs from the fitted EBE; author the matching EBE simulator")
+  idat[paste0("ETA",seq_along(ebe_names))] <- idat[ebe_names]
+} else if(!all(tolower(ebe_names) %in% tolower(ebe_params))) stop("Simulator does not accept every fitted EBE as a parameter")
+eta_source <- if(length(eta_positions)) "idata.all" else "omega"
+captures <- c(PK="IPRED",if(has_pd_capture) c(PD="IPRED_PD"))
+convert <- list(PK=function(x) pmx_pkpd_natural(x,rep(PK_ENDPOINT,length(x)),report_contract,PKPD_SIM_SCALE),
+  PD=function(x) pmx_pkpd_natural(x,rep(PD_ENDPOINT,length(x)),report_contract,PKPD_SIM_SCALE))
+exposure_report <- pmx_fit_exposure(mod_ebe,idat,df,captures,convert,eta_source)
+impact_cov <- pmx_fit_baseline_view(df,c("SEX","RACE","AGE","BW","BMI","ALB","CRCL"))
+expo_long <- exposure_report$values %>% left_join(impact_cov,by="ID")
+
+impact_reference <- impact_cov[impact_cov$ID %in% exposure_report$values$ID,,drop=FALSE]
+expo_long <- expo_long %>% mutate(
+  AGE_G  = pmx_fit_impact_groups("AGE",AGE,impact_reference$AGE),
+  BMI_G  = pmx_fit_impact_groups("BMI",BMI,impact_reference$BMI),
+  CRCL_G = pmx_fit_impact_groups("CRCL",CRCL,impact_reference$CRCL),
+  BW_G   = pmx_fit_impact_groups("BW",BW,impact_reference$BW),
+  ALB_G  = pmx_fit_impact_groups("ALB",ALB,impact_reference$ALB),
+  SEX_G = pmx_fit_category_group("SEX",SEX),
+  RACE_G = pmx_fit_category_group("RACE",RACE))
+
+EXPO_YLAB <- PK_YLAB
+EXPO_XLAB <- stats::setNames(var_labels[c("SEX","RACE","AGE","BW","BMI","ALB","CRCL")],
+  c("SEX_G","RACE_G","AGE_G","BW_G","BMI_G","ALB_G","CRCL_G"))
+EXPO_SECTION <- c(SEX_G="5.6.1 Sex",RACE_G="5.6.2 Race",
+  AGE_G="5.6.3 Age",BW_G="5.6.4 Body weight",BMI_G="5.6.5 BMI",ALB_G="5.6.6 Albumin",
+  CRCL_G="5.6.7 Renal function (creatinine clearance)")
+EXPO_PLOTS <- pmx_fit_covariate_figures(expo_long,EXPO_SECTION,EXPO_XLAB,
+  roles=c(PK="PK exposure",PD="PD response"),ylabels=c(PK=PK_YLAB,PD="PD response"))
+```
+
+## 4.3 Impact of Covariates on PK/PD
+
+```{r covariate-impact, results='asis', fig.show='asis', fig.width=9, fig.height=if(length(EXPO_PLOTS)) vapply(EXPO_PLOTS,`[[`,0,"height") else 4.5, fig.cap=vapply(EXPO_PLOTS,`[[`,"","caption")}
+pmx_fit_show_covariate_figures(EXPO_PLOTS,EXPO_SECTION,EXPO_XLAB,fit_result_text)
+if(!has_pd_capture)
+  cat("\nPD covariate-impact figures are unavailable because the frozen EBE simulator does not capture a PD prediction.\n")
+```
+
+# 5. Diagnostic Plots
+
+```{r diagnostics-interpretation, results='asis'}
+fit_result_text("5.5 Model evaluation")
+for(note in pmx_fit_optimization_note(fit)) cat("\n\n",note,"\n\n",sep="")
+```
+## CWRES Diagnostics
+
+```{r cwres-diagnostics, results='asis', fig.width=10, fig.height=7, fig.cap="CWRES diagnostics by PK and PD endpoint"}
+cwres_panels <- list()
+for(role in c("PK","PD")) {
+  endpoint <- if(role=="PK") PK_ENDPOINT else PD_ENDPOINT
+  panels <- pmx_fit_residual_plots(est$aug,endpoint,role,if(role=="PK") PK_YLAB else "response")
+  if(!length(panels)) cat("\n\nNative CWRES are unavailable for the ",role," endpoint; its CWRES diagnostic is omitted.\n\n",sep="")
+  cwres_panels <- c(cwres_panels,panels)
+}
+if(length(cwres_panels)) {
+  for(i in seq_along(cwres_panels)) cwres_panels[[i]] <- cwres_panels[[i]]+labs(tag=LETTERS[i])
+  gridExtra::grid.arrange(grobs=cwres_panels,ncol=2)
+}
+```
+
+## 5.1 PK Goodness-of-Fit
+
+```{r pk-gof, fig.width=12, fig.height=8, fig.cap="PK observed versus population and individual predictions"}
+panels <- pmx_fit_gof_plots(est$aug,PK_ENDPOINT,"PK",PK_YLAB,extra=FALSE)
+if(length(panels)) gridExtra::grid.arrange(grobs=panels,ncol=2)
+```
+
+```{r pk-gof-extra, fig.width=12, fig.height=4, fig.cap="PK weighted-residual diagnostics and fitted time profiles"}
+panels <- pmx_fit_gof_plots(est$aug,PK_ENDPOINT,"PK",PK_YLAB,extra=TRUE)
+if(length(panels)) gridExtra::grid.arrange(grobs=panels,ncol=3)
+```
+
+## 5.2 PD Goodness-of-Fit
+
+```{r pd-gof, fig.width=12, fig.height=8, fig.cap="PD observed versus population and individual predictions"}
+panels <- pmx_fit_gof_plots(est$aug,PD_ENDPOINT,"PD","response",extra=FALSE)
+if(length(panels)) gridExtra::grid.arrange(grobs=panels,ncol=2)
+```
+
+```{r pd-gof-extra, fig.width=12, fig.height=4, fig.cap="PD weighted-residual diagnostics and fitted time profiles"}
+panels <- pmx_fit_gof_plots(est$aug,PD_ENDPOINT,"PD","response",extra=TRUE)
+if(length(panels)) gridExtra::grid.arrange(grobs=panels,ncol=3)
+```
+
+## 5.3 Individual Fits
+
+```{r indiv-fits, fig.width=10, fig.height=8, fig.cap="Individual observed and fitted PK and PD profiles"}
+aug <- est$aug
+set.seed(123)
+sample_ids <- sample_subjects(aug$ID)
+aug_sample <- aug %>%
+  filter(ID %in% sample_ids) %>%
+  mutate(ENDPOINT = factor(DVID, levels = c(PK_ENDPOINT, PD_ENDPOINT), labels = c("PK", "PD")))
+
+ggplot(aug_sample, aes(TIME, DV)) +
+  geom_point(aes(color = ENDPOINT), size = 1) +
+  geom_line(aes(y = IPRED, color = ENDPOINT), linewidth = 0.8) +
+  facet_wrap(~ ID, scales = "free_y") +
+  scale_y_log10() +
+  scale_color_manual(values = c("PK" = "steelblue", "PD" = "darkorange")) +
+  labs(x = "Time (h)", y = "Value", color = "Endpoint") +
+  theme_bw()
+```
+
+## 5.4 VPC (Visual Predictive Check)
+
+```{r vpc-sim, eval=RUN_VPC, include=FALSE}
+
+require_vpc_contract(CPP_SIM,c("DV_PK","DV_PD"))
+update_cpp_covariates(CPP_SIM, fit, SCM_CPP_MAP)
+
+mod_sim <- pmx_report_update_model(mread(CPP_SIM),est,PKPD_SIGMA_MAP)
+
+sim_data <- df %>%
+  transmute(ID, time = TIME, evid = EVID, amt = AMT, cmt = CMT, mdv = MDV,
+            dvid = SOURCE_DVID, endpoint = DVID)
+for(v in intersect(c("RATE","II","ADDL","SS"),names(df))) sim_data[[tolower(v)]] <- df[[v]]
+sim_data <- pmx_sim_covariates(mod_sim,sim_data,df,scm_cov,names(est$fixef))
+
+vpc_pop <- mod_sim %>% mrgsolve::zero_re() %>% data_set(sim_data) %>%
+  carry_out(evid, cmt, mdv, dvid, endpoint) %>%
+  mrgsim(end = -1, outvars = c("IPRED", "IPRED_PD")) %>%
+  as.data.frame() %>%
+  filter(evid == 0, mdv == 0) %>%
+  transmute(ID = as.character(ID), time, dvid = as.integer(endpoint),
+            POP_PRED = pmx_pkpd_natural(ifelse(dvid == PK_ENDPOINT, IPRED, IPRED_PD),dvid,report_contract,PKPD_SIM_SCALE))
+vpc_pop <- unique_prediction(vpc_pop,c("ID","time","dvid"))
+vpc_obs_all <- df %>%
+  filter(EVID == 0, MDV == 0) %>%
+  transmute(ID, time = TIME, DV, dvid = as.integer(DVID)) %>%
+  arrange(ID, time)
+
+aug_pred <- observation_aug(est$aug) %>%
+  filter(!is.na(DVID)) %>%
+  transmute(ID = as.character(ID), time = TIME,
+            dvid = as.integer(DVID), PRED)   # pmx_pkpd_aug already reports DV/PRED/IPRED naturally
+aug_pred <- unique_prediction(aug_pred,c("ID","time","dvid"))
+
+vpc_obs_all <- vpc_obs_all %>%
+  mutate(ID_chr = as.character(ID)) %>%
+  left_join(aug_pred, by = c("ID_chr" = "ID", "time", "dvid")) %>%
+  select(-ID_chr)
+if (anyNA(vpc_obs_all$PRED))
+  stop(sprintf("PCVPC: %d observed records have no PRED in est$aug",
+               sum(is.na(vpc_obs_all$PRED))))
+
+# Validate once before spending the VPC simulation budget; a strict reference never refits.
+pmx_sim_prediction_check(aug_pred,vpc_pop,keys=c("ID","time","dvid"),tag="VPC pkpd",
+  reference=function() pmx_native_population(fit,convert=function(value,endpoint) pmx_pkpd_natural(value,endpoint,report_contract)),diagnostics=file.path("table","_simulator_validation.json"))
+vpc_obs_all <- pmx_vpc_population(vpc_obs_all,vpc_pop,keys=c("ID","time","dvid"))
+
+set.seed(666666)
+vpc_sim_all <- lapply(seq_len(VPC_NSIM), function(i) {
+  mod_sim %>% data_set(sim_data) %>%
+    carry_out(evid, cmt, mdv, dvid, endpoint) %>%
+    mrgsim(end = -1, outvars = c("IPRED", "IPRED_PD", "DV_PK", "DV_PD")) %>%
+    as.data.frame() %>% mutate(rep = i)
+}) %>% bind_rows() %>%
+  filter(evid == 0, mdv == 0) %>%
+  mutate(dvid=as.integer(endpoint),
+         IPRED = pmx_pkpd_natural(ifelse(dvid == PK_ENDPOINT, IPRED, IPRED_PD),dvid,report_contract,PKPD_SIM_SCALE),
+         DV_SIM = pmx_pkpd_natural(ifelse(dvid == PK_ENDPOINT, DV_PK, DV_PD),dvid,report_contract,PKPD_SIM_SCALE)) %>%
+  arrange(rep, ID, time)
+
+vpc_sim_all <- vpc_sim_all %>%
+  mutate(ID_chr = as.character(ID)) %>%
+  left_join(vpc_pop, by = c("ID_chr" = "ID", "time", "dvid")) %>%
+  select(-ID_chr) %>% rename(PRED = POP_PRED)
+if (anyNA(vpc_sim_all$PRED))
+  stop("VPC: a simulated record has no population prediction")
+
+
+pmx_vpc_records(vpc_obs_all,transform(vpc_sim_all,IPRED=DV_SIM),VPC_NSIM,keys=c("ID","time","dvid"))
+
+vpc_sim <- function(d) vpc_sim_all %>% filter(dvid == d) %>%
+  transmute(ID, time, IPRED = DV_SIM, PRED, rep)
+vpc_obs <- function(d) vpc_obs_all %>% filter(dvid == d) %>%
+  select(ID, time, DV, PRED)   # DV and PRED are both on the natural scale
+
+```
+
+```{r simulator-validation-note, results='asis'}
+for(note in pmx_fit_simulator_note()) cat(note,"\n\n")
+```
+
+```{r vpc-pk, eval=RUN_VPC, fig.width=9, fig.height=9, fig.cap="Visual predictive check of PK concentrations"}
+vpc_pk <- observed(vpc_obs(PK_ENDPOINT), x = time, y = DV) %>%
+  simulated(vpc_sim(PK_ENDPOINT), y = IPRED) %>%
+  binning(bin = "jenks", nbins = 12) %>%
+  vpcstats(qpred = c(0.05, 0.5, 0.95))
+
+vpc_panels(plot(vpc_pk), PK_YLAB)
+```
+
+```{r pcvpc-pk, eval=RUN_VPC, fig.width=9, fig.height=9, fig.cap="Prediction-corrected visual predictive check of PK concentrations"}
+pcvpc_pk <- observed(vpc_obs(PK_ENDPOINT), x = time, y = DV) %>%
+  simulated(vpc_sim(PK_ENDPOINT), y = IPRED) %>%
+  binning(bin = "jenks", nbins = 14) %>%
+  predcorrect(pred = PRED) %>%
+  vpcstats(qpred = c(0.05, 0.5, 0.95))
+
+vpc_panels(
+  plot(pcvpc_pk) +
+    geom_point(data = as.data.frame(pcvpc_pk$obs), aes(x = x, y = ypc),
+    inherit.aes = FALSE, shape = 1, colour = "grey25",
+    size = 1, alpha = 0.35)
+  , paste("Prediction-corrected",PK_YLAB))
+```
+
+```{r vpc-pd, eval=RUN_VPC, fig.width=9, fig.height=9, fig.cap="Visual predictive check of PD response"}
+vpc_pd <- observed(vpc_obs(PD_ENDPOINT), x = time, y = DV) %>%
+  simulated(vpc_sim(PD_ENDPOINT), y = IPRED) %>%
+  binning(bin = "jenks", nbins = 12) %>%
+  vpcstats(qpred = c(0.05, 0.5, 0.95))
+
+vpc_panels(plot(vpc_pd), "PD response")
+```
+
+```{r pcvpc-pd, eval=RUN_VPC, fig.width=9, fig.height=9, fig.cap="Prediction-corrected visual predictive check of PD response"}
+pcvpc_pd <- observed(vpc_obs(PD_ENDPOINT), x = time, y = DV) %>%
+  simulated(vpc_sim(PD_ENDPOINT), y = IPRED) %>%
+  binning(bin = "jenks", nbins = 14) %>%
+  predcorrect(pred = PRED) %>%
+  vpcstats(qpred = c(0.05, 0.5, 0.95))
+
+vpc_panels(
+  plot(pcvpc_pd) +
+    geom_point(data = as.data.frame(pcvpc_pd$obs), aes(x = x, y = ypc),
+    inherit.aes = FALSE, shape = 1, colour = "grey25",
+    size = 1, alpha = 0.35)
+  , "Prediction-corrected PD response")
+```
+
+# 6. Discussion
+
+```{r discussion, results='asis'}
+if(length(current_prose$Discussion)) cat(paste(current_prose$Discussion,collapse="\n\n"),"\n")
+```
+
+# 7. Conclusions
+
+```{r conclusions, results='asis'}
+if(length(current_prose$Conclusion)) cat(paste(current_prose$Conclusion,collapse="\n\n"),"\n")
+```

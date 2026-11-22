@@ -1,0 +1,42 @@
+
+.pmx-runtime.local.json
+
+# Private deployment settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+runtime.local.json
+*_runtime.local.json
+
+# Local sessions, generated analyses and build caches
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.pmx/
+__pycache__/
+*.py[cod]
+node_modules/
+*.so
+*.so.*
+*.dll
+*.o
+*.obj
+*.exe
+*.log
+*.bak
+*.tmp
+~$*
+.DS_Store
+Thumbs.db
+
+# Local historical backups
+.orig_*
+_previous_sources/
+
+# Example CSV, CTL, CPP, configuration and DOCX files are intentionally tracked.
+
+# Local R worker queue
+.pmx-runtime/

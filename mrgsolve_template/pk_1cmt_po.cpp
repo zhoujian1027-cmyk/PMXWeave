@@ -1,0 +1,28 @@
+$PARAM TVKA = 1, TVCL = 5, TVV = 50, TVF1 = 1, TVALAG = 0
+
+$CMT DEPOT CENTRAL
+
+$OMEGA
+0.09 0.16 0.25
+
+$SIGMA
+0.1
+
+$MAIN
+double KA = TVKA * exp(ETA(1));
+double CL = TVCL * exp(ETA(2));
+double VC = TVV * exp(ETA(3));
+F_DEPOT = TVF1;
+ALAG_DEPOT = TVALAG;
+
+$ODE
+dxdt_DEPOT = -KA * DEPOT;
+dxdt_CENTRAL = KA * DEPOT - (CL / VC) * CENTRAL;
+
+$TABLE
+double IPRED = CENTRAL / VC;
+
+double DV = IPRED + IPRED * EPS(1);
+
+$CAPTURE IPRED DV
+

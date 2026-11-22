@@ -1,0 +1,18 @@
+* text=auto
+*.R text eol=lf
+*.Rmd text eol=lf
+*.r text eol=lf
+*.mjs text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.ctl text eol=lf
+*.cpp text eol=lf
+*.csv -text
+*.docx binary
+*.png binary
+
+# Preserve original archived example bytes, including their source line endings.
+example/** -text
