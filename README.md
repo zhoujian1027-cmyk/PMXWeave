@@ -68,13 +68,13 @@ UD-Q4_K_XL quantization), with reasoning set to Low. The R worker used R 4.5.1,
 nlmixr2 7.0.1, nlmixr2est 7.1.0, rxode2 5.1.7.1, nonmem2rx 0.1.11,
 mrgsolve 2.0.1, rmarkdown 2.32, Pandoc 3.8.2.1, officer 0.7.6, and flextable 0.10.1.
 
-| Analysis | Final HTML (min:sec) | Final Word (min) |
+| Analysis | Start to Final HTML (min) | Start to Final Word (min) |
 |---|---:|---:|
-| Population PK | 34:12 | 42.7 |
-| PK/PD | 20:47 | 24.3 |
-| TMDD | 45:09 | 48.8 |
-| Exposure–response | 10:54 | 10.9 |
-| Concentration–QTc | 12:10 | 12.2 |
+| Population PK | 34.2 | 42.7 |
+| PK/PD | 20.8 | 24.3 |
+| TMDD | 45.2 | 48.8 |
+| Exposure–response | 10.9 | 10.9 |
+| Concentration–QTc | 12.2 | 12.2 |
 
 Reported times include agent preparation, R analysis, and any narrative
 revisions. The local agent handled model fitting, results interpretation, and
