@@ -28,6 +28,12 @@ screens models, accesses files, and generates reports.
 
 ## Example PK/PD prompts
 
+### output Nonmem control stream only in chat
+
+```text
+Nonmem code for 2 cmt PKPD turnover model with inhibitory effect on Kout, IV drug
+```
+
 ### Generate reports from the supplied base model
 
 ```text
