@@ -1,127 +1,84 @@
-# PMXWeave
-
-PMXWeave is an open-source knowledge base and toolkit for AI agents working
-in pharmacometrics. It combines reusable instructions, NONMEM control-stream
-and mrgsolve templates, and executable R workflows. Agents can draft NONMEM
-control streams directly in chat, draw model structure diagrams, and use study
-data to produce population PK, PK/PD, TMDD, exposure-response, and
-concentration-QTc reports. Report templates for other model types can be added
-as needed.
-
-Agents can also prepare PsN SCM configuration files and bootstrap command
-scripts for use with a licensed NONMEM installation and PsN.
-
-Given a readable model file from another modeling application, the AI agent can
-interpret its model definition and generate a corresponding NONMEM control
-stream or mrgsolve model file.
-
-Development testing used synthetic datasets with Qwen3.8-Flash-Next in
-Q4_K_XL quantization and covered five analysis families.
-
-## Workflow
-
-For population-modeling analyses, the typical workflow is
-
-**Data → base model → stepwise covariate modeling (SCM) → final model →
-uncertainty estimation and diagnostics → HTML report → Word report with
-limited AI-assisted data interpretation.**
-
-Exposure-response and concentration-QTc analyses follow their corresponding
-regression workflows.
-
-Long R jobs run in the background. In Deepseek harness, completion notifications let the
-agent continue from saved progress. Keep one observer per job and avoid
-repeated status checks or duplicate submissions.
-
-The agent can screen candidate base models using BIC, trying up to six models
-by default; this limit can be adjusted in the rules as needed. However, model
-screening can be computationally expensive. Users are encouraged to provide or
-confirm the base model, including by describing it in a natural-language prompt,
-and to review the data definitions and analysis settings. Starting from a
-user-selected base model generally provides a more efficient workflow.
-
-The current estimation backend uses nlmixr2/nlmixr2est with FOCEI. Supported
-NONMEM-style control streams are translated through nonmem2rx into rxode2 models,
-and mrgsolve supports simulation. Exposure-response and concentration-QTc
-analyses use R regression and mixed-effects packages, including survival and
-lme4. Figures and reports use ggplot2, rmarkdown, officer, and flextable.
-See [third-party software](THIRD_PARTY_NOTICES.md) for attribution and dependencies.
-
-The workflow could be extended to invoke a licensed NONMEM installation through
-its command-line interface. This integration has not been tested and may require
-NONMEM command templates to be added to the knowledge base. It would also require
-an execution and result-reading adapter, together with validation of the
-integrated workflow.
-
-Agent-generated code, model choices, diagnostics, and report interpretations
-require review by a pharmacometrician.
-
-Use [INDEX.md](INDEX.md) to select the analysis and
-[AGENTS.md](AGENTS.md) for agent instructions.
+PMXWeave is an open-source pharmacometrics knowledge base and toolkit for AI agents. It supports authoring NONMEM and mrgsolve models, translating models from other software, drawing model structure diagrams, estimating parameters in R, and generating HTML and Word reports.
 
 ## Runtime setup
 
-Chat-based model authoring needs no R runtime. Reports require R and the analysis
-packages, a C++ compiler, Pandoc, Node.js, Python and a POSIX shell. Use the study/output
-folder authorized by the user. Set up an R queue worker [locally or in Docker](analyses_template/tools/runtime_paths.md)
-and set PMX_RUNTIME_CONFIG or the Git-ignored local runtime pointer. The setup
-guide includes a connection check. Name the actual study
-path in your prompt and ensure the host agent permissions allow it. The study
-may be outside the current workspace; Deepseek harness Full Access requires no separate PMX
-directory whitelist. Keep writes restricted to the requested output location.
+Agents can quickly draft models directly in chat without an R runtime. Report generation requires the R dependencies and a configured queue worker, which can run locally.
+The core PMXWeave toolkit is under 2 MB. The `example/` folder is an optional download with sample data and example reports.
+
+## Background jobs
+
+Long-running R jobs run in the background. When the agent harness sends a completion notification, the agent can resume from saved progress. Use one observer per job and avoid redundant status checks or duplicate submissions.
 
 ## Performance and customization
 
-By default, the workspace rules direct the agent to read only the knowledge
-base and any study directory you explicitly name. You can ask your agent to
-edit [AGENTS.md](AGENTS.md) to change those rules. Your agent application
-controls actual filesystem access.
+By default, PMXWeave directs the agent to read only the knowledge base and the study directories you explicitly name. To customize these rules, ask the agent to edit `AGENTS.md`. Your agent application controls filesystem access and can use a local model or a supported online model API.
 
-Use a local model or an online model API supported by your agent application.
-Select the provider and model there.
+CPU time for parameter estimation is the main factor in how long model-fitting
+workflows take. The AI model's capabilities influence which base models it proposes
+and how accurately it interprets the final results.
 
-For model-fitting workflows, overall analysis speed is primarily limited by
-CPU-based parameter estimation. The AI model's capabilities influence candidate
-base-model selection and the interpretation of final results.
+AI-generated results interpretation is experimental. Review it carefully against the underlying analysis before relying on it.
 
-The instructions in [references/](references/) can be updated to suit local
-requirements and guide or constrain the agent's behavior, including limits on
-model screening, file access and report-generation workflows.
+Direct interpretation of plots, including goodness-of-fit diagnostics and visual predictive checks, requires a model that can read images. A text-only model can summarize tables and structured results. Have a reviewer assess findings that depend on visual inspection.
 
-## Synthetic examples
+You can adapt the instructions in `references/` to specify how the agent
+screens models, accesses files, and generates reports.
 
-Each study folder contains the analysis data, data dictionary, configuration,
-and completed Word report. The population PK, PK/PD, and TMDD examples also
-include the base and final model files and covariate definitions.
+## Example PK/PD prompts
 
-| Analysis | Example study | Word report |
-|---|---|---|
-| Population PK | [PPK](example/ppk/) | [Report](example/ppk/ppk_report.docx) |
-| PK/PD | [PK/PD](example/pkpd/) | [Report](example/pkpd/pkpd_report.docx) |
-| TMDD | [TMDD](example/tmdd/) | [Report](example/tmdd/tmdd_report.docx) |
-| Exposure-response | [ER](example/er/) | [Report](example/er/ER_report.docx) |
-| Concentration-QTc | [c-QTc](example/cqtc/) | [Report](example/cqtc/CQTC_report.docx) |
+### Generate reports from the supplied base model
 
-To rerun an example, copy its study folder to a location available to your
-configured R worker and follow the corresponding workflow in [INDEX.md](INDEX.md).
+```text
+I have a PK/PD dataset in example/pkpd/. Start with stepwise covariate
+modeling (SCM) using the supplied base_model.ctl. Fit the final model and
+generate diagnostics. Produce the HTML report first, followed by the Word
+report. Save all outputs in the study directory.
+```
 
-### Example figures
+### Screen base models and generate reports
 
-**TMDD model structure**
+```text
+I have a PK/PD dataset in example/pkpd/. Compare one- and two-compartment
+IV PK models by pairing each PK structure with each of the following four
+indirect-response PD models:
 
-![TMDD model structure](example/figures/tmdd-model-structure.png)
+- Linear inhibition of KOUT
+- Emax inhibition of KOUT
+- Linear stimulation of KIN
+- Emax stimulation of KIN
 
-**Population PK — observed versus predicted concentration**
+Set the candidate limit to eight and screen all eight combinations. Report
+the fit status and, where available, the BIC for each candidate. Recommend a
+base model based on BIC, fit quality, and scientific plausibility.
 
-![Observed versus predicted PK concentrations](example/figures/ppk-observed-versus-predicted.png)
+Run stepwise covariate modeling (SCM) from the selected base model, fit the
+final model, and generate diagnostics. Produce the HTML report first, followed
+by the Word report. Save all outputs in the study directory.
+```
 
-**Exposure-response — probability of objective response**
+## Local report generation benchmark
 
-![Estimated probability of objective response by exposure](example/figures/er-objective-response.png)
+The benchmark covered five synthetic studies, run one at a time.
+Runtimes vary with the dataset, model complexity, and computing environment.
+The test system had an AMD Ryzen 9 5900XT (16 cores, 32 threads), 125.7 GiB of DDR4 RAM
+visible to Linux, and an AMD Radeon RX 7900 XTX with 24 GiB of VRAM.
 
-<img src="example/figures/cqtc-simulation.png" alt="Concentration-QTc simulation" width="50%">
+Deepseek harness 0.2.0-rc.2 used Strata-rdna3 (Qwen3.8-Flash-Next with
+UD-Q4_K_XL quantization), with reasoning set to Low. The R worker used R 4.5.1,
+nlmixr2 7.0.1, nlmixr2est 7.1.0, rxode2 5.1.7.1, nonmem2rx 0.1.11,
+mrgsolve 2.0.1, rmarkdown 2.32, Pandoc 3.8.2.1, officer 0.7.6, and flextable 0.10.1.
 
-## License and software
+| Analysis | Final HTML (min:sec) | Final Word (min) |
+|---|---:|---:|
+| Population PK | 34:12 | 42.7 |
+| PK/PD | 20:47 | 24.3 |
+| TMDD | 45:09 | 48.8 |
+| Exposure–response | 10:54 | 10.9 |
+| Concentration–QTc | 12:10 | 12.2 |
 
-Project-owned code and templates use the [MIT License](LICENSE).
-Software attribution is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Reported times include agent preparation, R analysis, and any narrative
+revisions. The local agent handled model fitting, results interpretation, and
+recovery from simulator issues.
+
+Contact: Jian Zhou
+LinkedIn: https://www.linkedin.com/in/jian-zhou-a93533b9
