@@ -92,9 +92,9 @@ recovery from simulator issues.
 
 **Exposure-response — probability of objective response**
 
-![Estimated probability of objective response by exposure](example/figures/er-objective-response.png)
+<img src="example/figures/er-objective-response.png" alt="Estimated probability of objective response by exposure" width="75%">
 
-<img src="example/figures/cqtc-simulation.png" alt="Concentration-QTc simulation" width="50%">
+<img src="example/figures/cqtc-simulation.png" alt="Concentration-QTc simulation" width="62.5%">
 
 Contact: Jian Zhou
 LinkedIn: https://www.linkedin.com/in/jian-zhou-a93533b9
