@@ -1,6 +1,7 @@
 PMXWeave is an open-source pharmacometrics knowledge base and toolkit for AI agents. It supports authoring NONMEM and mrgsolve models, translating models from other software, drawing model structure diagrams, estimating parameters in R, and generating HTML and Word reports.
 
 To get started, open the PMXWeave folder as your AI agent’s workspace.
+To expand the NONMEM/mrgsolve library, simply add your model files to the corresponding template folder.
 
 ## Runtime setup
 
@@ -13,7 +14,7 @@ Long-running R jobs run in the background. When the agent harness sends a comple
 
 ## Performance and customization
 
-By default, PMXWeave directs the agent to read only the knowledge base and the study directories you explicitly name. To customize these rules, ask the agent to edit `AGENTS.md`. Your agent application controls filesystem access and can use a local model or a supported online model API. To expand the NONMEM/mrgsolve library, simply add your model files to the corresponding template folder.
+By default, PMXWeave directs the agent to read only the knowledge base and the study directories you explicitly name. To customize these rules, ask the agent to edit `AGENTS.md`. Your agent application controls filesystem access and can use a local model or a supported online model API. 
 
 CPU time for parameter estimation is the main factor in how long model-fitting
 workflows take. The AI model's capabilities influence which base models it proposes
